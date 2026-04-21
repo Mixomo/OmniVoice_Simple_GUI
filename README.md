@@ -4,6 +4,14 @@ A comprehensive and optimized WebUI for working with **OmniVoice** on Windows. T
 
 ---
 
+<img src="./assets/prep_samples_tab.png">
+
+<img src="./assets/inference_tab.png">
+
+<img src="./assets/dataset_prep_tab.png">
+
+<img src="./assets/training_tab.png">
+
 ## 🔄 Application Workflow
 
 The GUI is designed around a 4-step logical workflow:

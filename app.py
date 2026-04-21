@@ -661,8 +661,7 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
     # --- Title Section ---
     with gr.Row(elem_classes="title-section"):
         with gr.Column(scale=4):
-            gr.Markdown("# 🚀 OmniVoice Universal GUI")
-            gr.Markdown("Stabilized and optimized for Windows - Unified Model & LoRA loader")
+            gr.Markdown("# OmniVoice Simple GUI: Inference + LoRA Training")
         with gr.Column(scale=1):
             gr.Markdown("""
             [📖 Documentation](https://github.com/k2-fsa/OmniVoice)

@@ -20,9 +20,8 @@ if %errorlevel% equ 0 (
     echo [SUCCESS] 'uv' installed successfully.
     
     :: 3. Refresh PATH for the current session
-    :: Adding common uv installation paths to the local session environment
-    set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
-    set "PATH=%APPDATA%\astral-sh\uv;%PATH%"
+    :: Adding common uv installation paths to the local session environment using Batch syntax
+    set "PATH=%USERPROFILE%\.cargo\bin;%APPDATA%\uv\bin;%PATH%"
 )
 
 :: 4. Run uv sync
@@ -34,5 +33,3 @@ if %errorlevel% equ 0 (
 ) else (
     echo [WARNING] 'uv sync' failed. Make sure you are in a directory with a pyproject.toml file.
 )
-
-pause
