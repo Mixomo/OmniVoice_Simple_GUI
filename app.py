@@ -430,7 +430,7 @@ def prepare_voxcpm_dataset(source_folder, dataset_name, val_split, batch_size, l
     return f"Dataset preparation for '{dataset_name}' (Split: {val_split}) started in background."
 
 
-def run_inference(text, ref_audio, ref_text, model_selection, cfg_scale, steps, seed, control, duration=None, t_shift=0.1, pos_temp=5.0, class_temp=0.0, layer_penalty=5.0, chunk_dur=15.0, chunk_thr=30.0, use_ref_text=True, tags_list=None, pp=True, po=True):
+def run_inference(text, ref_audio, ref_text, model_selection, cfg_scale, steps, seed, control, duration=None, t_shift=0.1, pos_temp=5.0, class_temp=0.0, layer_penalty=5.0, chunk_dur=15.0, chunk_thr=30.0, use_ref_text=True, tags_list=None, pp=True, po=True, progress=gr.Progress(), split_by_paragraph=False):
     global current_model
     
     # Unified model selection logic
@@ -444,16 +444,18 @@ def run_inference(text, ref_audio, ref_text, model_selection, cfg_scale, steps, 
     if "Error" in res:
         return None, res
     
-    if not text or not text.strip(): return None, "Please enter text."
+    # Prepare paragraphs based on split logic
+    if split_by_paragraph:
+        paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
+    else:
+        paragraphs = [text.strip()]
     
-    # Workaround for Spanish punctuation drop (Issue #116)
-    import re
-    text = re.sub(r'([,\.\!\?\;:])', r' \1', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    
-    # Prepend target text with chosen tags (e.g., [singing] [laughter])
-    if tags_list:
-        text = " ".join(tags_list) + " " + text
+    if not paragraphs or (len(paragraphs) == 1 and not paragraphs[0]):
+        return None, "Error: No text provided for generation."
+
+    num_clips = len(paragraphs)
+    audio_segments = []
+    sampling_rate = 16000 # default fallback
     
     if seed != -1:
         torch.manual_seed(seed)
@@ -472,26 +474,59 @@ def run_inference(text, ref_audio, ref_text, model_selection, cfg_scale, steps, 
         preprocess_prompt=bool(pp), 
         postprocess_output=bool(po)
     )
-    
-    kw = {
-        "text": text.strip(), 
-        "language": None, 
-        "generation_config": gen_config,
-        "duration": float(duration) if duration and float(duration) > 0 else None
-    }
-    
-    if ref_audio:
-        # If use_ref_text is False, we pass None to ignore the transcript
-        final_ref_text = (ref_text or None) if use_ref_text else None
-        kw["voice_clone_prompt"] = current_model.create_voice_clone_prompt(ref_audio=ref_audio, ref_text=final_ref_text)
-    if control:
-        kw["instruct"] = control.strip()
-    
+
+    import re
+
     try:
-        audio_out = current_model.generate(**kw)
+        # Pre-calculate voice clone prompt if needed
+        voice_clone_prompt = None
+        if ref_audio:
+            final_ref_text = (ref_text or None) if use_ref_text else None
+            voice_clone_prompt = current_model.create_voice_clone_prompt(ref_audio=ref_audio, ref_text=final_ref_text)
+
+        for i, para in enumerate(paragraphs):
+            progress((i / num_clips), desc=f"Generating clip {i+1}/{num_clips} ({len(para)} chars)...")
+            
+            # Apply tags to each paragraph if provided
+            current_text = para.strip()
+            if tags_list:
+                current_text = " ".join(tags_list) + " " + current_text
+            
+            # Workaround for Spanish punctuation drop (Issue #116)
+            current_text = re.sub(r'([,\.\!\?\;:])', r' \1', current_text)
+            current_text = re.sub(r'\s+', ' ', current_text).strip()
+
+            current_kw = {
+                "text": current_text, 
+                "language": None, 
+                "generation_config": gen_config,
+                "duration": float(duration) if duration and float(duration) > 0 else None
+            }
+            if voice_clone_prompt:
+                current_kw["voice_clone_prompt"] = voice_clone_prompt
+            if control:
+                current_kw["instruct"] = control.strip()
+
+            audio_out = current_model.generate(**current_kw)
+            audio_segments.append(audio_out[0])
+            sampling_rate = current_model.sampling_rate
+            
+            # Add 0.5 second of silence after each paragraph (except the last one)
+            if split_by_paragraph and i < num_clips - 1:
+                silence_len = int(sampling_rate * 0.5)
+                silence = np.zeros(silence_len, dtype=np.float32)
+                audio_segments.append(silence)
+
         play_done_chime()
-        waveform = (audio_out[0] * 32767).astype(np.int16)
-        return (current_model.sampling_rate, waveform), "Generation Success"
+        
+        # Concatenate all segments
+        if len(audio_segments) > 1:
+            full_audio = np.concatenate(audio_segments)
+        else:
+            full_audio = audio_segments[0]
+
+        waveform = (full_audio * 32767).astype(np.int16)
+        return (sampling_rate, waveform), f"Generation Success! {num_clips} clips processed."
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -903,6 +938,19 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                             scale=4
                         )
                     
+                    with gr.Row():
+                        infer_split_by_paragraph = gr.Checkbox(
+                            label="Split by Paragraph (for long texts)", 
+                            value=False, 
+                            info="ℹ️ *To apply splits, you must press **Enter** after each sentence or point where you want a cut; each line break will generate an independent audio clip that will be automatically merged.*",
+                            scale=3
+                        )
+                        infer_clips_count = gr.Markdown(
+                            value="*1 clip detected*",
+                            visible=False,
+                            elem_classes="clips-count-mini"
+                        )
+                    
                     with gr.Accordion("⚙️ Decoding & Sampling Parameters", open=False):
                         with gr.Row():
                             infer_steps = gr.Slider(label="Inference Steps (num_step)", minimum=1, maximum=64, value=32, step=1)
@@ -969,6 +1017,19 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
             infer_ref_audio.change(fn=smart_asr_unified, inputs=[infer_ref_audio, infer_ref_text, infer_use_ref_text, infer_whisper_model], outputs=[infer_ref_text])
             infer_use_ref_text.change(fn=on_use_ref_text_change, inputs=[infer_use_ref_text, infer_sample_select, infer_ref_audio, infer_ref_text, infer_whisper_model], outputs=[infer_ref_text])
             
+            def update_clips_count(text, enabled):
+                if not enabled:
+                    return gr.update(visible=False)
+                if not text:
+                    return gr.update(visible=True, value="*1 clip detected*")
+                paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
+                count = len(paragraphs)
+                label = f"**{count} clips detected**" if count > 1 else "*1 clip detected*"
+                return gr.update(visible=True, value=label)
+
+            infer_text.change(update_clips_count, inputs=[infer_text, infer_split_by_paragraph], outputs=[infer_clips_count])
+            infer_split_by_paragraph.change(update_clips_count, inputs=[infer_text, infer_split_by_paragraph], outputs=[infer_clips_count])
+            
             infer_gen_btn.click(
                 run_inference,
                 inputs=[
@@ -990,7 +1051,8 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                     infer_use_ref_text,
                     infer_instruct_tags,
                     infer_pp,
-                    infer_po
+                    infer_po,
+                    infer_split_by_paragraph
                 ],
                 outputs=[infer_audio_out, infer_status_out],
             )
