@@ -27,6 +27,6 @@ examples/download*
 examples/exp*/
 .claude/
 *.jsonl
-models/
+/models/
 samples/
 uv.lock
