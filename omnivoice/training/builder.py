@@ -77,8 +77,10 @@ def build_model_and_tokenizer(
         tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
 
     # 2. Model
-    # Forced to SDPA for maximum stability on Windows/Consumer GPUs.
+    # Reverting to sdpa for maximum stability across all GPU architectures.
+    # sdpa uses FlashAttention when available and doesn't require complex patches.
     attn_impl = "sdpa"
+    logger.info(f"Using attn_implementation={attn_impl} for stability.")
 
     if config.init_from_checkpoint:
         logger.info(f"Loading weights from {config.init_from_checkpoint} (Attn: {attn_impl})")

@@ -599,7 +599,7 @@ def main() -> None:
     with open(manifest_path, "w", encoding="utf-8") as mf:
         for idx in sorted(shard_manifest.keys()):
             tar_path, jsonl_path, count, duration = shard_manifest[idx]
-            mf.write(f"{tar_path} {jsonl_path} {count} {duration:.3f}\n")
+            mf.write(f"{tar_path.replace('\\', '/')} {jsonl_path.replace('\\', '/')} {count} {duration:.3f}\n")
 
     # Output final statistics
     total_failed = error_count + write_error_count

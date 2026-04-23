@@ -9,7 +9,6 @@ import random
 import datetime
 from pathlib import Path
 from typing import Optional
-import winsound
 
 import gradio as gr
 import numpy as np
@@ -69,7 +68,12 @@ def play_done_chime():
     chime_path = project_root / "assets" / "inference_training_done.wav"
     if chime_path.exists():
         try:
-            winsound.PlaySound(str(chime_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+            if shutil.which("paplay"):
+                subprocess.Popen(["paplay", str(chime_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif shutil.which("aplay"):
+                subprocess.Popen(["aplay", "-q", str(chime_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif shutil.which("ffplay"):
+                subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(chime_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except: pass
 
 def load_omnivoice(checkpoint):
@@ -98,7 +102,8 @@ def load_omnivoice(checkpoint):
             checkpoint = str(dest_path)
             
         device = get_best_device()
-        m = OmniVoice.from_pretrained(checkpoint, device_map=device, dtype=torch.float16, load_asr=False, attn_implementation="sdpa")
+        attn_impl = "sdpa"
+        m = OmniVoice.from_pretrained(checkpoint, device_map=device, dtype=torch.float16, load_asr=False, attn_implementation=attn_impl)
             
         current_model = m
         current_checkpoint = checkpoint

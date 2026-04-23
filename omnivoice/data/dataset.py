@@ -177,8 +177,8 @@ def webdataset_manifest_reader(
                     "tar_path, label_jsonl_path, num_items, num_seconds."
                 )
             tar_path, label_jsonl_path, num_items, num_seconds = (
-                parts[0],
-                parts[1],
+                parts[0].replace("\\", "/"),
+                parts[1].replace("\\", "/"),
                 int(parts[2]),
                 float(parts[3]),
             )

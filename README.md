@@ -1,6 +1,6 @@
 # 🎙️ OmniVoice Simple GUI: Unified Voice Cloning & Fine-Tuning
 
-A comprehensive and optimized WebUI for working with **OmniVoice** on Windows. This application provides a seamless pipeline for dataset preparation, model training (LoRA), and high-quality voice synthesis.
+A comprehensive and optimized WebUI for working with **OmniVoice** on Linux/WSL2. This application provides a seamless pipeline for dataset preparation, model training (LoRA), and high-quality voice synthesis.
 
 ---
 
@@ -26,7 +26,7 @@ The GUI is designed around a 4-step logical workflow:
 ## ⚙️ System Requirements & Hardware
 
 ### 💻 Software Dependencies
-*   **OS:** Windows 10/11.
+*   **OS:** Linux/WSL2.
 *   **Python:** 3.10 – 3.11.
 *   **Cuda:** 12.1+ recommended.
 *   **VRAM Management:** The UI includes safety margins for all presets to prevent OOM errors during training.
@@ -64,14 +64,25 @@ This project uses `uv` for high-performance dependency management.
 ## Clone the repository:
 
 ```bash
-git clone https://github.com/Mixomo/OmniVoice_Simple_GUI.git
+git clone -b main_linux https://github.com/Mixomo/OmniVoice_Simple_GUI.git
+```
+
+## Give scripts execute permissions:
+
+```bash
+chmod +x install.sh start.sh
 ```
 
 ### Setup Steps
-1.  **Run Installer:** Double-click `install.bat`.
-    * This installs `uv` via Winget (if not present).
-    * Synchronizes the environment and installs all required libraries automatically.
-2.  **Launch App:** Double-click `start.bat`.
+1.  **Run Installer:** Execute the installation script in your terminal:
+    ```bash
+    ./install.sh
+    ```
+    * This installs `uv` (if not present) and synchronizes the environment automatically.
+2.  **Launch App:** Start the WebUI:
+    ```bash
+    ./start.sh
+    ```
 3.  **Access:** Navigate to `http://127.0.0.1:7860` in your web browser.
 
 ---

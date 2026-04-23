@@ -387,10 +387,11 @@ class OmniTrainer:
             
             # 2. Load Inference Model (Full dependencies: vocoders, etc.)
             from omnivoice.models.omnivoice import OmniVoice
-            # Use eager and CPU/GPU swap for stability
+            # Use sdpa for maximum stability
+            inf_attn = "sdpa"
             inf_model = OmniVoice.from_pretrained(
                 checkpoint_dir, 
-                attn_implementation="eager", # Safe on Windows
+                attn_implementation=inf_attn,
                 dtype=torch.float32
             )
             inf_model.to(original_device)
