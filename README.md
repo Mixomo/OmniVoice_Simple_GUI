@@ -12,6 +12,17 @@ A comprehensive and optimized WebUI for working with **OmniVoice** on Windows. T
 
 <img src="./assets/training_tab.png">
 
+### 2026-04-24 - Add Dialogue Builder - Multi Speaker Support Inference
+We've introduced a **Dialogue Builder** sub-tab within the Voice Clone interface, designed for creating multi-speaker interactions easily:
+
+*   **Dynamic Row Management**: Effortlessly build dialogues by adding (`➕`), cloning (`📋`), or removing (`🗑️`) speaker segments. 
+*   **Multi-Speaker Support**: Assign a different voice sample and custom text to every segment in the conversation.
+*   **Sequential Synthesis**: Generates each segment independently using the shared global settings (Engine, Model, Temperature, etc.) and automatically concatenates them.
+*   **Customizable Silences**: Control the natural flow of the conversation with a dedicated slider to adjust the duration of silence (0 to 5 seconds) between each speaker.
+*   **Internal Audio Mastering**: Every output is automatically volume normalized before rendering, ensuring professional consistency across all segments.
+
+<img src="./assets/dialogue_builder.png">
+
 ## 🔄 Application Workflow
 
 The GUI is designed around a 4-step logical workflow:

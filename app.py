@@ -674,6 +674,143 @@ def launch_tensorboard(output_name):
     return "TensorBoard launched at http://localhost:6006"
 
 
+def add_dialogue_row_at(index, count, *args):
+    num = 20
+    samples = list(args[:num])
+    texts = list(args[num:2*num])
+    
+    if count < num:
+        samples.insert(index + 1, samples[index])
+        texts.insert(index + 1, "")
+        samples.pop()
+        texts.pop()
+        count += 1
+    
+    updates = [count]
+    updates.extend([gr.update(value=samples[i], visible=(i < count)) for i in range(num)])
+    updates.extend([gr.update(value=texts[i], visible=(i < count)) for i in range(num)])
+    updates.extend([gr.update(visible=(i < count)) for i in range(num)])
+    return updates
+
+def rem_dialogue_row_at(index, count, *args):
+    num = 20
+    samples = list(args[:num])
+    texts = list(args[num:2*num])
+    
+    if count > 1:
+        samples.pop(index)
+        texts.pop(index)
+        samples.append(None)
+        texts.append("")
+        count -= 1
+        
+    updates = [count]
+    updates.extend([gr.update(value=samples[i], visible=(i < count)) for i in range(num)])
+    updates.extend([gr.update(value=texts[i], visible=(i < count)) for i in range(num)])
+    updates.extend([gr.update(visible=(i < count)) for i in range(num)])
+    return updates
+
+def clone_dialogue_row_at(index, count, *args):
+    num = 20
+    samples = list(args[:num])
+    texts = list(args[num:2*num])
+    
+    if count < num:
+        samples.insert(index + 1, samples[index])
+        texts.insert(index + 1, texts[index])
+        samples.pop()
+        texts.pop()
+        count += 1
+        
+    updates = [count]
+    updates.extend([gr.update(value=samples[i], visible=(i < count)) for i in range(num)])
+    updates.extend([gr.update(value=texts[i], visible=(i < count)) for i in range(num)])
+    updates.extend([gr.update(visible=(i < count)) for i in range(num)])
+    return updates
+
+def generate_dialogue(model_selection, cfg_scale, steps, seed, duration, t_shift, pos_temp, class_temp, layer_penalty, chunk_dur, chunk_thr, pp, po, tags_list, split_para, use_ref_text, row_count, silence_between, global_control, *args, progress=gr.Progress()):
+    num_max = 20
+    samples = args[:num_max]
+    texts = args[num_max:2*num_max]
+    
+    segments = []
+    for i in range(int(row_count)):
+        s = samples[i]
+        t = texts[i]
+        if s and t:
+            segments.append((s, t))
+            
+    if not segments:
+        return None, "Please add at least one speaker and text."
+        
+    all_audio_segments = []
+    final_sr = 16000 # default
+    
+    for i, (sample_name, text) in enumerate(segments):
+        progress((i / len(segments)), desc=f"Processing segment {i+1}/{len(segments)} ({sample_name})...")
+        
+        # Load sample
+        ref_audio, ref_text = load_sample(sample_name)
+        if not ref_audio and sample_name != "None":
+            print(f"Sample {sample_name} not found, skipping segment {i+1}")
+            continue
+            
+        result, status = run_inference(
+            text=text, 
+            ref_audio=ref_audio, 
+            ref_text=ref_text, 
+            model_selection=model_selection, 
+            cfg_scale=cfg_scale, 
+            steps=steps, 
+            seed=seed, 
+            control=global_control, 
+            duration=duration,
+            t_shift=t_shift,
+            pos_temp=pos_temp,
+            class_temp=class_temp,
+            layer_penalty=layer_penalty,
+            chunk_dur=chunk_dur,
+            chunk_thr=chunk_thr,
+            use_ref_text=use_ref_text,
+            tags_list=tags_list,
+            pp=pp,
+            po=po,
+            progress=progress, 
+            split_by_paragraph=split_para
+        )
+        
+        if result is not None:
+            sr, audio_data = result
+            final_sr = sr
+            
+            # Normalize segment to mono and peak amplitude
+            if len(audio_data.shape) > 1:
+                audio_data = np.mean(audio_data, axis=1) # to mono
+                
+            # Convert to float32 for processing
+            audio_float = audio_data.astype(np.float32) / 32768.0
+            
+            # Peak normalize
+            max_amp = np.max(np.abs(audio_float))
+            if max_amp > 0:
+                audio_float = audio_float / max_amp * 0.95
+                
+            all_audio_segments.append(audio_float)
+            
+            # Add silence
+            if i < len(segments) - 1:
+                silence_len = int(final_sr * silence_between)
+                all_audio_segments.append(np.zeros(silence_len, dtype=np.float32))
+                
+    if all_audio_segments:
+        combined = np.concatenate(all_audio_segments)
+        audio_int16 = (combined * 32767).astype(np.int16)
+        play_done_chime()
+        return (final_sr, audio_int16), f"Dialogue generated successfully with {len(segments)} segments!"
+    
+    return None, "No audio generated."
+
+
 # --- GUI Layout ---
 
 # Add CSS classes matching the reference script
@@ -684,6 +821,8 @@ css = """
 .input-field { margin-bottom: 15px; }
 .button-primary { background-color: #2563eb !important; color: white !important; }
 .button-stop { background-color: #ef4444 !important; color: white !important; }
+.green-btn { background-color: #28a745 !important; color: white !important; border: none !important; }
+.red-btn { background-color: #dc3545 !important; color: white !important; border: none !important; }
 """
 
 with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as app:
@@ -776,9 +915,8 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
             gr.Markdown("### 🎙️ Unified Voice Synthesis")
             
             with gr.Row():
-                # --- Left Column: Reference & Voice Selection ---
-                with gr.Column(scale=1, elem_classes="form-section"):
-                    gr.Markdown("#### 🎙️ Model & Reference")
+                with gr.Column(scale=1):
+                    gr.Markdown("#### 🎙️ Model & Global Settings")
                     with gr.Row():
                         infer_model_select = gr.Dropdown(
                             label="OmniVoice Model", 
@@ -797,32 +935,6 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                             info="Model for transcribing reference audio if needed.",
                             scale=5
                         )
-
-                    with gr.Row():
-                        infer_sample_select = gr.Dropdown(
-                            choices=get_sample_choices(),
-                            value="None",
-                            label="Quick Sample Select",
-                            info="Load a reference from your 'samples' library.",
-                            scale=4
-                        )
-                        refresh_infer_sample_btn = gr.Button("🔄", scale=1, min_width=50)
-                    
-                    infer_ref_audio = gr.Audio(label="Reference Audio (3-10s recommended)", type="filepath", value=default_audio)
-                    with gr.Row():
-                        infer_use_ref_text = gr.Checkbox(
-                            label="Use Reference Text (Transcription)", 
-                            value=True,
-                            info="Disabling transcription may improve quality, diction, and pronunciation in some cases / languages (avoiding slurring or skipped words)."
-                        )
-                    
-                    infer_ref_text = gr.Textbox(
-                        label="Reference Text / Transcription", 
-                        placeholder="Automatic transcription if enabled and left empty...", 
-                        lines=2,
-                        value=default_text,
-                        interactive=True
-                    )
                     
                     gr.Markdown("#### 🎭 Voice Design (Speaker Attributes)")
                     with gr.Row():
@@ -926,31 +1038,8 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                     infer_instruct_zh.change(update_instruct_visual, inputs=[infer_instruct_en, infer_instruct_zh, infer_instruct_tags], outputs=[infer_control, infer_control_display])
                     infer_instruct_tags.change(update_instruct_visual, inputs=[infer_instruct_en, infer_instruct_zh, infer_instruct_tags], outputs=[infer_control, infer_control_display])
 
-                # --- Right Column: Content & Generation Settings ---
-                with gr.Column(scale=1, elem_classes="form-section"):
-                    gr.Markdown("#### ✍️ Target Speech")
-                    with gr.Row():
-                        infer_text = gr.Textbox(
-                            label="Target Text", 
-                            placeholder="Enter the text you want the AI to speak...", 
-                            lines=10,
-                            value="[laughter] Hello! I can speak with any voice you provide as a reference.",
-                            scale=4
-                        )
-                    
-                    with gr.Row():
-                        infer_split_by_paragraph = gr.Checkbox(
-                            label="Split by Paragraph (for long texts)", 
-                            value=False, 
-                            info="ℹ️ *To apply splits, you must press **Enter** after each sentence or point where you want a cut; each line break will generate an independent audio clip that will be automatically merged.*",
-                            scale=3
-                        )
-                        infer_clips_count = gr.Markdown(
-                            value="*1 clip detected*",
-                            visible=False,
-                            elem_classes="clips-count-mini"
-                        )
-                    
+                with gr.Column(scale=1):
+                    gr.Markdown("#### 🛠️ Advanced Engine Settings")
                     with gr.Accordion("⚙️ Decoding & Sampling Parameters", open=False):
                         with gr.Row():
                             infer_steps = gr.Slider(label="Inference Steps (num_step)", minimum=1, maximum=64, value=32, step=1)
@@ -974,11 +1063,116 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                             infer_chunk_dur = gr.Slider(label="Chunk Duration", minimum=5.0, maximum=30.0, value=15.0, step=1.0)
                             infer_chunk_thr = gr.Slider(label="Chunk Threshold", minimum=10.0, maximum=60.0, value=30.0, step=1.0)
 
-                    infer_gen_btn = gr.Button("⚡ Generate Speech", variant="primary", size="lg", elem_classes="button-primary")
+            with gr.Tabs():
+                with gr.Tab("Single Inference"):
+                    with gr.Row():
+                        with gr.Column(scale=1, elem_classes="form-section"):
+                            gr.Markdown("#### 🎙️ Voice Sample")
+                            with gr.Row():
+                                infer_sample_select = gr.Dropdown(
+                                    choices=get_sample_choices(),
+                                    value="None",
+                                    label="Quick Sample Select",
+                                    info="Load a reference from your 'samples' library.",
+                                    scale=4
+                                )
+                                refresh_infer_sample_btn = gr.Button("🔄", scale=1, min_width=50)
+                            
+                            infer_ref_audio = gr.Audio(label="Reference Audio (3-10s recommended)", type="filepath", value=default_audio)
+                            with gr.Row():
+                                infer_use_ref_text = gr.Checkbox(
+                                    label="Use Reference Text (Transcription)", 
+                                    value=True,
+                                    info="Disabling transcription may improve quality, diction, and pronunciation in some cases / languages (avoiding slurring or skipped words)."
+                                )
+                            
+                            infer_ref_text = gr.Textbox(
+                                label="Reference Text / Transcription", 
+                                placeholder="Automatic transcription if enabled and left empty...", 
+                                lines=2,
+                                value=default_text,
+                                interactive=True
+                            )
+
+                        with gr.Column(scale=1, elem_classes="form-section"):
+                            gr.Markdown("#### ✍️ Target Speech")
+                            with gr.Row():
+                                infer_text = gr.Textbox(
+                                    label="Target Text", 
+                                    placeholder="Enter the text you want the AI to speak...", 
+                                    lines=6,
+                                    value="[laughter] Hello! I can speak with any voice you provide as a reference.",
+                                    scale=4
+                                )
+                            
+                            with gr.Row():
+                                infer_split_by_paragraph = gr.Checkbox(
+                                    label="Split by Paragraph (for long texts)", 
+                                    value=False, 
+                                    info="ℹ️ *To apply splits, you must press **Enter** after each sentence or point where you want a cut; each line break will generate an independent audio clip that will be automatically merged.*",
+                                    scale=3
+                                )
+                                infer_clips_count = gr.Markdown(
+                                    value="*1 clip detected*",
+                                    visible=False,
+                                    elem_classes="clips-count-mini"
+                                )
+                            
+                            infer_gen_btn = gr.Button("⚡ Generate Speech", variant="primary", size="lg", elem_classes="button-primary")
+                            
+                            with gr.Group():
+                                infer_audio_out = gr.Audio(label="Generated Audio")
+                                infer_status_out = gr.Textbox(label="System Status", interactive=False)
+                
+                with gr.Tab("Dialogue Builder"):
+                    gr.Markdown("#### 💬 Multi-Speaker Dialogue Builder")
+                    dialogue_segments = []
+                    MAX_DIALOGUE_SEGMENTS = 20
+                    dialogue_row_count = gr.State(2)
+                    dialogue_samples = []
+                    dialogue_texts = []
+                    dialogue_rows = []
+                    dialogue_add_btns = []
+                    dialogue_rem_btns = []
+                    dialogue_clone_btns = []
                     
-                    with gr.Group():
-                        infer_audio_out = gr.Audio(label="Generated Audio")
-                        infer_status_out = gr.Textbox(label="System Status", interactive=False)
+                    with gr.Column():
+                        for i in range(MAX_DIALOGUE_SEGMENTS):
+                            with gr.Row(visible=(i < 2)) as row:
+                                with gr.Column(scale=3):
+                                    s = gr.Dropdown(choices=sample_choices, label=f"Speaker {i+1}", value=default_sample_name if i < 2 else "None")
+                                t = gr.Textbox(placeholder=f"Enter text for speaker {i+1}...", label=f"Text {i+1}", scale=7, lines=6)
+                                with gr.Row(scale=1):
+                                    add_btn = gr.Button("➕", variant="secondary", size="sm", elem_classes=["green-btn"])
+                                    clone_btn = gr.Button("📋", variant="secondary", size="sm")
+                                    rem_btn = gr.Button("🗑️", variant="stop", size="sm", elem_classes=["red-btn"])
+                                    
+                            dialogue_rows.append(row)
+                            dialogue_samples.append(s)
+                            dialogue_texts.append(t)
+                            dialogue_add_btns.append(add_btn)
+                            dialogue_rem_btns.append(rem_btn)
+                            dialogue_clone_btns.append(clone_btn)
+                            
+                    with gr.Row():
+                        with gr.Column():
+                            dialogue_use_ref_text = gr.Checkbox(
+                                label="Use Reference Text (Transcription)", 
+                                value=True,
+                                info="Disabling transcription may improve quality, diction, and pronunciation in some cases / languages (avoiding slurring or skipped words)."
+                            )
+                        with gr.Column():
+                            dialogue_split_para_check = gr.Checkbox(label="Split by Paragraphs (Recommended for long texts)", value=False)
+                            gr.Markdown("ℹ️ *To apply splits, you must press **Enter** after each sentence or point where you want a cut; each line break will generate an independent audio clip that will be automatically merged.*")
+                        with gr.Column():
+                            dialogue_silence_slider = gr.Slider(0, 5, value=0.5, step=0.1, label="Silence between speakers (s)")
+
+                    dialogue_gen_btn = gr.Button("⚡ Generate Dialogue", variant="primary", size="lg", elem_classes="button-primary")
+                    
+                    with gr.Row():
+                        dialogue_audio_out = gr.Audio(label="Generated Dialogue", type="filepath")
+                    with gr.Row():
+                        dialogue_status_out = gr.Textbox(label="Status", interactive=False, lines=2)
             
             # --- Unified Event Handlers ---
             def refresh_models():
@@ -994,14 +1188,14 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
 
             def on_use_ref_text_change(use_ref, sample_name, current_audio, current_text, whisper_model):
                 if not use_ref:
-                    return ""
+                    return gr.update(visible=False)
                 # Reload if enabling and empty
                 if not current_text or not current_text.strip():
                     _, text = load_sample(sample_name)
                     if not text: # If still empty, try ASR
-                        return recognize_audio(current_audio, whisper_model)
-                    return text
-                return current_text
+                        text = recognize_audio(current_audio, whisper_model)
+                    return gr.update(visible=True, value=text)
+                return gr.update(visible=True, value=current_text)
 
             def on_sample_change(sample_name, use_ref):
                 audio, text = load_sample(sample_name)
@@ -1056,6 +1250,53 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                 ],
                 outputs=[infer_audio_out, infer_status_out],
             )
+            
+            # Dialogue Builder Events
+            for i in range(MAX_DIALOGUE_SEGMENTS):
+                dialogue_add_btns[i].click(
+                    fn=add_dialogue_row_at,
+                    inputs=[gr.State(i), dialogue_row_count] + dialogue_samples + dialogue_texts,
+                    outputs=[dialogue_row_count] + dialogue_samples + dialogue_texts + dialogue_rows
+                )
+                dialogue_rem_btns[i].click(
+                    fn=rem_dialogue_row_at,
+                    inputs=[gr.State(i), dialogue_row_count] + dialogue_samples + dialogue_texts,
+                    outputs=[dialogue_row_count] + dialogue_samples + dialogue_texts + dialogue_rows
+                )
+                dialogue_clone_btns[i].click(
+                    fn=clone_dialogue_row_at,
+                    inputs=[gr.State(i), dialogue_row_count] + dialogue_samples + dialogue_texts,
+                    outputs=[dialogue_row_count] + dialogue_samples + dialogue_texts + dialogue_rows
+                )
+                
+
+                
+            dialogue_gen_btn.click(
+                generate_dialogue,
+                inputs=[
+                    infer_model_select,
+                    infer_cfg,
+                    infer_steps,
+                    infer_seed,
+                    infer_duration,
+                    infer_t_shift,
+                    infer_pos_temp,
+                    infer_class_temp,
+                    infer_layer_penalty,
+                    infer_chunk_dur,
+                    infer_chunk_thr,
+                    infer_pp,
+                    infer_po,
+                    infer_instruct_tags,
+                    dialogue_split_para_check,
+                    dialogue_use_ref_text,
+                    dialogue_row_count,
+                    dialogue_silence_slider,
+                    infer_control
+                ] + dialogue_samples + dialogue_texts,
+                outputs=[dialogue_audio_out, dialogue_status_out]
+            )
+
             
         # === 3. Dataset Preparation Tab ===
         with gr.Tab("📂 Dataset Preparation", id="tab_dataset") as tab_dataset:
