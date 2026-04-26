@@ -26,6 +26,8 @@ TOKEN_DIR="data/finetune/tokens"
 TOKENIZER_PATH="eustlb/higgs-audio-v2-tokenizer"
 
 # Training config file
+# If you encounter issues with flex_attention on your GPU, use the SDPA config instead:
+# TRAIN_CONFIG="config/train_config_finetune_sdpa.json"
 TRAIN_CONFIG="config/train_config_finetune.json"
 
 # Data config file

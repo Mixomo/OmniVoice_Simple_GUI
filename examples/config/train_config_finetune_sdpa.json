@@ -31,6 +31,10 @@
 
     "mixed_precision": "bf16",
     "allow_tf32": true,
+    "attn_implementation": "sdpa",
+    "max_sample_tokens": 2000,
+    "min_sample_tokens": 50,
+    "max_batch_size": 64,
 
     "logging_steps": 50,
     "eval_steps": 500,

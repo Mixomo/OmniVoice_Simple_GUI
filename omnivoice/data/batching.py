@@ -22,9 +22,10 @@ variable-length audio.
 
 Key classes:
 - ``PackingIterableDataset``: Packs multiple samples into fixed-length sequences
-  for training. Used by ``omnivoice.training.builder``.
+  for training. Used by ``omnivoice.training.builder`` with flex_attention.
 - ``StreamLengthGroupDataset``: Groups samples by length into buckets. Used by
-  data processing scripts (e.g. ``omnivoice/scripts/``).
+  data processing scripts (e.g. ``omnivoice/scripts/``) and by
+  ``omnivoice.training.builder`` when ``attn_implementation != "flex_attention"``.
 """
 
 import bisect
@@ -38,7 +39,17 @@ from omnivoice.data.dataset import IterableDataReader, WrappedIterableDataset
 
 class StreamLengthGroupDataset(WrappedIterableDataset):
     """A streaming dataset that groups samples by their lengths into buckets.
-    Only support audio data for now."""
+
+    By default, length is measured as audio duration in seconds from a raw
+    waveform field. Pass a custom ``length_fn`` to use a different measure —
+    e.g. ``lambda s: s["length"]`` for processed training data, in which case
+    ``batch_duration`` and ``min/max_length`` should use the same units.
+
+    If ``processor`` is provided, each raw sample is processed before length
+    measurement and bucketing, and the yielded batches contain **processed**
+    samples. This allows accurate bucketing by post-processing token length
+    (used in the SDPA training path).
+    """
 
     def __init__(
         self,
@@ -50,6 +61,8 @@ class StreamLengthGroupDataset(WrappedIterableDataset):
         audio_key: str = "audio",
         drop_last: bool = False,
         max_sample: Optional[int] = None,
+        length_fn: Optional[Any] = None,
+        processor: Optional[Any] = None,
     ):
         self.dataset = dataset
         self.batch_duration = batch_duration
@@ -59,6 +72,8 @@ class StreamLengthGroupDataset(WrappedIterableDataset):
         self.audio_key = audio_key
         self.drop_last = drop_last
         self.max_sample = max_sample if max_sample is not None else float("inf")
+        self.length_fn = length_fn
+        self.processor = processor
 
         self.boundaries = np.linspace(min_length, max_length, num_buckets + 1)[1:]
 
@@ -77,8 +92,18 @@ class StreamLengthGroupDataset(WrappedIterableDataset):
         bucket_max_len = [0.0] * self.num_buckets
 
         for sample in self.dataset:
-            audio = sample[self.audio_key]
-            duration = audio.size(-1) / self.dataset.sample_rate
+            if self.processor is not None:
+                try:
+                    sample = self.processor(sample)
+                except Exception as e:
+                    logging.warning(f"Error processing sample: {e}")
+                    continue
+
+            if self.length_fn is not None:
+                duration = self.length_fn(sample)
+            else:
+                audio = sample[self.audio_key]
+                duration = audio.size(-1) / self.dataset.sample_rate
 
             if duration < self.min_length or duration > self.max_length:
                 # logging.warning(f"Skipping sample with duration {duration:.2f}s")

@@ -1,5 +1,9 @@
 import os
 import sys
+import time
+
+# Set PyTorch allocation conf to prevent VRAM fragmentation / memory leaks
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import json
 import glob
 import subprocess
@@ -10,6 +14,7 @@ import datetime
 from pathlib import Path
 from typing import Optional
 import winsound
+import math
 
 import gradio as gr
 import numpy as np
@@ -22,6 +27,10 @@ from huggingface_hub import snapshot_download
 # OmniVoice imports
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from omnivoice.utils.lang_map import LANG_NAMES, lang_display_name
+from omnivoice.utils.windows_patch import apply_triton_windows_patch, apply_flex_attention_patch
+
+# Apply critical Windows patches before anything else
+apply_triton_windows_patch()
 
 project_root = Path(__file__).parent.absolute()
 
@@ -48,6 +57,11 @@ def unload_asr():
         print("Unloading ASR model...", file=sys.stderr)
         del asr_model
         asr_model = None
+        if hasattr(asr_model, "to"):
+            try: asr_model.to("cpu")
+            except: pass
+        del asr_model
+        asr_model = None
         import gc
         gc.collect()
         if torch.cuda.is_available():
@@ -57,6 +71,9 @@ def unload_omnivoice():
     global current_model, current_checkpoint
     if current_model is not None:
         print("Unloading OmniVoice model...", file=sys.stderr)
+        if hasattr(current_model, "to"):
+            try: current_model.to("cpu")
+            except: pass
         del current_model
         current_model = None
         current_checkpoint = None
@@ -72,17 +89,12 @@ def play_done_chime():
             winsound.PlaySound(str(chime_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
         except: pass
 
-def load_omnivoice(checkpoint):
+def load_omnivoice(checkpoint, attn_implementation="sdpa"):
     global current_model, current_checkpoint
     
-    # If the requested checkpoint is already loaded, do nothing
-    if current_model is not None and current_checkpoint == checkpoint:
-        return "Model Already Loaded"
-        
-    # If a different model is loaded, unload it first
-    if current_model is not None:
-        unload_omnivoice()
-        
+    # Force a complete cleanup if switching checkpoints or if no model is loaded
+    unload_omnivoice()
+    
     # Ensure ASR is unloaded before loading OmniVoice
     unload_asr()
     
@@ -98,7 +110,7 @@ def load_omnivoice(checkpoint):
             checkpoint = str(dest_path)
             
         device = get_best_device()
-        m = OmniVoice.from_pretrained(checkpoint, device_map=device, dtype=torch.float16, load_asr=False, attn_implementation="sdpa")
+        m = OmniVoice.from_pretrained(checkpoint, device_map=device, dtype=torch.float16, load_asr=False, attn_implementation=attn_implementation)
             
         current_model = m
         current_checkpoint = checkpoint
@@ -119,6 +131,20 @@ WHISPER_MODELS = {
     "large-v2 (~10 GB VRAM)": "Systran/faster-whisper-large-v2",
     "large-v3 (~10 GB VRAM)": "Systran/faster-whisper-large-v3",
     "distil-large-v3 (~5 GB VRAM)": "Systran/faster-distil-whisper-large-v3"
+}
+
+WHISPER_LANGS = {
+    "Auto-detect": None,
+    "English": "en",
+    "Spanish": "es",
+    "French": "fr",
+    "German": "de",
+    "Italian": "it",
+    "Portuguese": "pt",
+    "Chinese": "zh",
+    "Japanese": "ja",
+    "Korean": "ko",
+    "Russian": "ru"
 }
 
 current_asr_name = None
@@ -196,15 +222,17 @@ def save_prep_sample(audio_path, sample_name, transcription):
     
     return f"Sample '{sample_name}' saved successfully (Audio + JSON + TXT)!"
 
-def recognize_audio(audio_path, whisper_model="large-v3 (~10 GB VRAM)"):
-    if not audio_path: return ""
+def recognize_audio(audio_path, whisper_model="large-v3 (~10 GB VRAM)", language="Auto-detect"):
+    if not audio_path: return "", None
     try:
         model = get_or_load_asr_model(whisper_model)
-        segments, _ = model.transcribe(audio_path, beam_size=5)
-        return "".join([s.text for s in segments]).strip()
+        lang_code = WHISPER_LANGS.get(language)
+        segments, info = model.transcribe(audio_path, beam_size=5, language=lang_code)
+        text = "".join([s.text for s in segments]).strip()
+        return text, info.language
     except Exception as e:
         print(f"ASR Error: {e}", file=sys.stderr)
-        return ""
+        return "", None
 
 def scan_datasets():
     datasets_root = project_root / "data"
@@ -248,7 +276,22 @@ def scan_lora_checkpoints(with_info=False):
                 checkpoints.append(rel_path)
     
     return sorted(checkpoints, key=lambda x: x[0] if isinstance(x, tuple) else x)
+
+def delete_lora_folder(name):
+    if not name or name.strip() == "":
+        return gr.update(), "Please select a project to delete."
     
+    path = project_root / "exp" / name
+    if not path.exists():
+        return gr.update(choices=get_existing_lora_projects()), f"Folder 'exp/{name}' does not exist."
+        
+    try:
+        import shutil
+        shutil.rmtree(path)
+        return gr.update(choices=get_existing_lora_projects(), value=""), f"Project '{name}' deleted successfully."
+    except Exception as e:
+        return gr.update(), f"Error deleting folder: {e}"
+
 def calculate_dataset_stats(manifest_path):
     if not manifest_path: return 0, 0, 0, 0
     
@@ -300,6 +343,9 @@ def refresh_loras():
 def prepare_voxcpm_dataset(source_folder, dataset_name, val_split, batch_size, lang_code="en", whisper_model="large-v3 (~10 GB VRAM)", progress=gr.Progress()):
     global extract_process
     
+    # If lang_code is "Auto-detect" or empty, we'll try to detect it from the first audio
+    target_lang = lang_code
+    
     if not source_folder or not os.path.exists(source_folder):
         print("Error: Please provide a valid source folder path.", file=sys.stderr)
         return "Error: Please provide a valid source folder path."
@@ -309,13 +355,17 @@ def prepare_voxcpm_dataset(source_folder, dataset_name, val_split, batch_size, l
         
     out_dir = project_root / "data" / dataset_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    jsonl_path = out_dir / "data.jsonl"
     
     print(f"Scanning {source_folder} for audios...", file=sys.stderr)
     valid_exts = (".wav", ".mp3", ".flac", ".m4a", ".ogg")
+    
+    # OS-aware scanning and explicit deduplication
     all_files = os.listdir(source_folder)
     audios = [os.path.join(source_folder, f) for f in all_files if f.lower().endswith(valid_exts)]
-    audios = sorted(list(set(audios))) # Extra safety against duplicates
+    
+    # Windows glob/listdir case-insensitivity fix: use dict.fromkeys for preservation of order + uniqueness
+    audios = list(dict.fromkeys(audios))
+    audios = sorted(audios)
     
     if not audios:
         print("Error: No audio files found in the source folder.", file=sys.stderr)
@@ -338,8 +388,9 @@ def prepare_voxcpm_dataset(source_folder, dataset_name, val_split, batch_size, l
         else:
             try:
                 asr = get_or_load_asr_model(whisper_model)
-                segments, _ = asr.transcribe(ap, beam_size=5, language=lang_code)
-                text = "".join([s.text for s in segments]).strip()
+                text, detected_lang = recognize_audio(ap, whisper_model, language="Auto-detect" if not target_lang or target_lang == "Auto-detect" else target_lang)
+                if not target_lang or target_lang == "Auto-detect":
+                    target_lang = detected_lang or "en"
             except Exception as e:
                 print(f"Failed to transcribe {ap}: {e}", file=sys.stderr)
         
@@ -349,7 +400,7 @@ def prepare_voxcpm_dataset(source_folder, dataset_name, val_split, batch_size, l
             "id": base,
             "audio_path": audio_path_clean,
             "text": text,
-            "language_id": lang_code
+            "language_id": target_lang
         })
         
     # Shuffling & Splitting
@@ -430,7 +481,7 @@ def prepare_voxcpm_dataset(source_folder, dataset_name, val_split, batch_size, l
     return f"Dataset preparation for '{dataset_name}' (Split: {val_split}) started in background."
 
 
-def run_inference(text, ref_audio, ref_text, model_selection, cfg_scale, steps, seed, control, duration=None, t_shift=0.1, pos_temp=5.0, class_temp=0.0, layer_penalty=5.0, chunk_dur=15.0, chunk_thr=30.0, use_ref_text=True, tags_list=None, pp=True, po=True, progress=gr.Progress(), split_by_paragraph=False):
+def run_inference(text, ref_audio, ref_text, model_selection, cfg_scale, steps, seed, control, duration=None, t_shift=0.1, pos_temp=5.0, class_temp=0.0, layer_penalty=5.0, chunk_dur=15.0, chunk_thr=30.0, use_ref_text=True, tags_list=None, pp=True, po=True, split_by_paragraph=False, attn_impl="sdpa", progress=gr.Progress()):
     global current_model
     
     # Unified model selection logic
@@ -440,7 +491,7 @@ def run_inference(text, ref_audio, ref_text, model_selection, cfg_scale, steps, 
         # Local LoRA path
         target_ckpt = os.path.abspath(model_selection)
         
-    res = load_omnivoice(target_ckpt)
+    res = load_omnivoice(target_ckpt, attn_implementation=attn_impl)
     if "Error" in res:
         return None, res
     
@@ -535,7 +586,7 @@ def run_inference(text, ref_audio, ref_text, model_selection, cfg_scale, steps, 
             return None, f"Triton/Compiler Error: {err_msg}. Please try switching Attention Implementation to 'sdpa' in Optimization settings."
         return None, f"Error: {err_msg}"
 
-def start_training(model_choice, train_manifest, val_manifest, output_name, lr, steps, batch_tokens, llm_name, resume_checkpoint, grad_accum, save_steps, eval_text, eval_audio, enable_eval, lang_code, warmup_ratio=0.01, repeat_factor=1):
+def start_training(model_choice, train_manifest, val_manifest, output_name, lr, steps, batch_tokens, llm_name, resume_checkpoint, grad_accum, save_steps, eval_text, eval_audio, enable_eval, lang_code, attn_impl, warmup_ratio=0.01, repeat_factor=1):
     global training_process
     if training_process and training_process.poll() is None:
         print("Training is already running.", file=sys.stderr)
@@ -570,12 +621,13 @@ def start_training(model_choice, train_manifest, val_manifest, output_name, lr, 
         "init_from_checkpoint": OMNIVOICE_MODELS.get(model_choice, "k2-fsa/OmniVoice"),
         "eval_text": eval_text.strip() if eval_text else "I am training and getting better every day.",
         "eval_ref_audio": final_eval_audio,
-        "enable_eval": bool(enable_eval)
+        "enable_eval": bool(enable_eval),
+        "attn_implementation": attn_impl
     }
 
     # Auto-adjust num_workers based on shard count (Recipe: num_workers <= shard count)
     try:
-        manifest_full = os.path.join(project_root, rel_train.replace("/", os.sep))
+        manifest_full = os.path.join(project_root, train_manifest.replace("/", os.sep))
         shard_dir = os.path.join(os.path.dirname(manifest_full), "audios")
         if os.path.exists(shard_dir):
             shards = [f for f in os.listdir(shard_dir) if f.endswith('.tar')]
@@ -592,7 +644,7 @@ def start_training(model_choice, train_manifest, val_manifest, output_name, lr, 
         train_config["num_workers"] = 1
 
     
-    if resume_checkpoint and resume_checkpoint.strip():
+    if resume_checkpoint and resume_checkpoint.strip() and resume_checkpoint != "None":
         # Ensure resume path is relative or at least clean of drive letter if possible
         rc = resume_checkpoint.strip()
         if os.path.isabs(rc):
@@ -664,14 +716,35 @@ def stop_training():
 def launch_tensorboard(output_name):
     if not output_name:
         return "Please select or type an Output Directory Name first."
-    tb_dir = project_root / "exp" / output_name / "tensorboard"
+    
+    # Just point to the project exp directory, TensorBoard will scan subfolders
+    # including the /tensorboard/ folder created by Accelerate
+    tb_dir = project_root / "exp" / output_name
     if not tb_dir.exists():
         tb_dir = project_root / "exp"
-    subprocess.Popen([sys.executable, "-m", "tensorboard.main", "--logdir", str(tb_dir), "--port", "6006"])
-    import webbrowser, time
-    time.sleep(2)
+    
+    # Kill any existing TensorBoard to avoid port conflicts
+    if sys.platform == "win32":
+        try:
+            subprocess.run(["taskkill", "/F", "/IM", "tensorboard.exe"], 
+                         capture_output=True, timeout=5)
+        except Exception:
+            pass
+    
+    if sys.platform == "win32":
+        # On Windows, open a new console window and keep it open (/k) so the user can see errors
+        tb_cmd_win = ["cmd.exe", "/k", sys.executable, "-m", "tensorboard.main", "--logdir", str(tb_dir), "--port", "6006", "--bind_all"]
+        import subprocess as sp
+        CREATE_NEW_CONSOLE = 0x00000010
+        subprocess.Popen(tb_cmd_win, creationflags=CREATE_NEW_CONSOLE)
+    else:
+        tb_cmd = [sys.executable, "-m", "tensorboard.main", "--logdir", str(tb_dir), "--port", "6006", "--bind_all"]
+        subprocess.Popen(tb_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    import webbrowser
+    time.sleep(3)
     webbrowser.open("http://localhost:6006")
-    return "TensorBoard launched at http://localhost:6006"
+    return f"TensorBoard launched at http://localhost:6006 (logdir: {tb_dir})"
 
 
 def add_dialogue_row_at(index, count, *args):
@@ -885,14 +958,21 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                         value=default_text
                     )
                     with gr.Row():
-                        transcribe_prep_btn = gr.Button("🔍 Transcribe", variant="secondary")
+                        transcribe_prep_btn = gr.Button("🔍 Transcribe", variant="secondary", scale=1)
                         prep_whisper_model = gr.Dropdown(
-                            label="🛰️ Whisper Processor",
+                            label="🛰️ Whisper Model",
                             choices=list(WHISPER_MODELS.keys()),
                             value="large-v3 (~10 GB VRAM)",
                             scale=1
                         )
-                        save_sample_name = gr.Textbox(label="Sample ID", placeholder="e.g. news_anchor_1", scale=2, value=default_sample_name)
+                        prep_whisper_lang = gr.Dropdown(
+                            label="🌐 Language",
+                            choices=list(WHISPER_LANGS.keys()),
+                            value="Auto-detect",
+                            scale=1
+                        )
+                    with gr.Row():
+                        save_sample_name = gr.Textbox(label="Sample ID", placeholder="e.g. news_anchor_1", scale=3, value=default_sample_name)
                         save_sample_btn = gr.Button("💾 Save Sample", variant="primary", scale=1)
 
                     
@@ -905,7 +985,11 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
             sample_dropdown.change(on_sample_change, inputs=[sample_dropdown], outputs=[prep_audio_player, prep_transcription, save_sample_name])
             refresh_samples_btn.click(lambda: gr.update(choices=get_sample_choices()), outputs=[sample_dropdown])
             
-            transcribe_prep_btn.click(fn=recognize_audio, inputs=[prep_audio_player, prep_whisper_model], outputs=[prep_transcription])
+            def transcribe_with_lang(audio, model, lang):
+                text, detected_lang = recognize_audio(audio, model, lang)
+                return text
+
+            transcribe_prep_btn.click(fn=transcribe_with_lang, inputs=[prep_audio_player, prep_whisper_model, prep_whisper_lang], outputs=[prep_transcription])
             save_sample_btn.click(fn=save_prep_sample, inputs=[prep_audio_player, save_sample_name, prep_transcription], outputs=[prep_op_status]).then(
                 fn=lambda: gr.update(choices=get_sample_choices()), outputs=[sample_dropdown]
             )
@@ -929,11 +1013,18 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
 
                     with gr.Row():
                         infer_whisper_model = gr.Dropdown(
-                            label="🛰️ Whisper Processor",
+                            label="🛰️ Whisper Model",
                             choices=list(WHISPER_MODELS.keys()),
                             value="large-v3 (~10 GB VRAM)",
-                            info="Model for transcribing reference audio if needed.",
-                            scale=5
+                            info="Model for transcribing reference audio.",
+                            scale=1
+                        )
+                        infer_whisper_lang = gr.Dropdown(
+                            label="🌐 Whisper Language",
+                            choices=list(WHISPER_LANGS.keys()),
+                            value="Auto-detect",
+                            info="Language of the reference audio.",
+                            scale=1
                         )
                     
                     gr.Markdown("#### 🎭 Voice Design (Speaker Attributes)")
@@ -1054,6 +1145,13 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                         with gr.Row():
                             infer_pp = gr.Checkbox(label="Pre-process Text (Normalization)", value=True)
                             infer_po = gr.Checkbox(label="Post-process Audio (Fading)", value=True)
+                        with gr.Row():
+                            infer_attn_impl = gr.Dropdown(
+                                label="Attention Implementation",
+                                choices=["sdpa", "flex_attention", "eager"],
+                                value="sdpa",
+                                info="Flex: Faster (patched for Windows). SDPA: Stable fallback."
+                            )
                     
                     with gr.Accordion("📏 Duration & Chunking", open=False):
                         with gr.Row():
@@ -1179,21 +1277,22 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                 choices = list(OMNIVOICE_MODELS.keys()) + [(f"{ckpt[0]} (Trained LoRa)", ckpt[0]) for ckpt in scan_lora_checkpoints(with_info=True)]
                 return gr.update(choices=choices)
 
-            def smart_asr_unified(audio, current_text, use_ref, whisper_model):
+            def smart_asr_unified(audio, current_text, use_ref, whisper_model, language):
                 if not use_ref: 
                     return current_text # Don't auto-transcribe if disabled manually
                 if current_text and current_text.strip():
                     return current_text
-                return recognize_audio(audio, whisper_model)
+                text, _ = recognize_audio(audio, whisper_model, language)
+                return text
 
-            def on_use_ref_text_change(use_ref, sample_name, current_audio, current_text, whisper_model):
+            def on_use_ref_text_change(use_ref, sample_name, current_audio, current_text, whisper_model, language):
                 if not use_ref:
                     return gr.update(visible=False)
                 # Reload if enabling and empty
                 if not current_text or not current_text.strip():
                     _, text = load_sample(sample_name)
                     if not text: # If still empty, try ASR
-                        text = recognize_audio(current_audio, whisper_model)
+                        text, _ = recognize_audio(current_audio, whisper_model, language)
                     return gr.update(visible=True, value=text)
                 return gr.update(visible=True, value=current_text)
 
@@ -1208,8 +1307,8 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
             refresh_model_btn.click(refresh_models, outputs=[infer_model_select])
             
             # Transcription triggered by audio change OR checkbox enable
-            infer_ref_audio.change(fn=smart_asr_unified, inputs=[infer_ref_audio, infer_ref_text, infer_use_ref_text, infer_whisper_model], outputs=[infer_ref_text])
-            infer_use_ref_text.change(fn=on_use_ref_text_change, inputs=[infer_use_ref_text, infer_sample_select, infer_ref_audio, infer_ref_text, infer_whisper_model], outputs=[infer_ref_text])
+            infer_ref_audio.change(fn=smart_asr_unified, inputs=[infer_ref_audio, infer_ref_text, infer_use_ref_text, infer_whisper_model, infer_whisper_lang], outputs=[infer_ref_text])
+            infer_use_ref_text.change(fn=on_use_ref_text_change, inputs=[infer_use_ref_text, infer_sample_select, infer_ref_audio, infer_ref_text, infer_whisper_model, infer_whisper_lang], outputs=[infer_ref_text])
             
             def update_clips_count(text, enabled):
                 if not enabled:
@@ -1246,7 +1345,8 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                     infer_instruct_tags,
                     infer_pp,
                     infer_po,
-                    infer_split_by_paragraph
+                    infer_split_by_paragraph,
+                    infer_attn_impl
                 ],
                 outputs=[infer_audio_out, infer_status_out],
             )
@@ -1353,17 +1453,24 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                             info="This will create a folder in 'data/' with your audios and data.lst.",
                             scale=3
                         )
+                        dataset_whisper_lang = gr.Dropdown(
+                            label="🌐 Whisper Language",
+                            choices=list(WHISPER_LANGS.keys()),
+                            value="Auto-detect",
+                            scale=2,
+                            info="Select to auto-fill ISO code."
+                        )
                         dataset_lang_iso = gr.Textbox(
                             label="Language ISO",
                             value="en",
                             scale=1,
-                            info="ISO code for auto-transcription (e.g. en, es, zh). See: docs/languages.md"
+                            info="ISO code (e.g. en, es, zh, ja, ko, etc). Supports 600+ languages."
                         )
                         dataset_whisper_model = gr.Dropdown(
-                            label="🛰️ Whisper Processor",
+                            label="🛰️ Whisper Model",
                             choices=list(WHISPER_MODELS.keys()),
                             value="large-v3 (~10 GB VRAM)",
-                            scale=3
+                            scale=2
                         )
                     
                     val_split_slider = gr.Slider(
@@ -1401,6 +1508,12 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                 inputs=[src_folder, dataset_name_input, val_split_slider, batch_size_slider, dataset_lang_iso, dataset_whisper_model],
                 outputs=[prep_status_out]
             )
+            
+            def update_iso_from_whisper(lang_name):
+                code = WHISPER_LANGS.get(lang_name)
+                return code if code else gr.update()
+
+            dataset_whisper_lang.change(update_iso_from_whisper, inputs=[dataset_whisper_lang], outputs=[dataset_lang_iso])
 
         # === 4. Training Tab ===
         with gr.Tab("🚀 Training") as tab_train:
@@ -1427,43 +1540,46 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
 
                     with gr.Row():
                         train_manifest = gr.Dropdown(
-                            label="Train Manifest (data.lst)",
+                            label="Train Manifest (train data.lst)",
                             choices=scan_datasets(),
-                            value=scan_datasets()[0] if scan_datasets() else None,
+                            value=None,
                             allow_custom_value=True,
                             scale=6,
-                            info="Select a manifest from 'data/' folder."
+                            info="Select a manifest from 'train/data.lst' folder."
                         )
                         lang_code = gr.Textbox(
                             label="Language ISO",
-                            value="en",
+                            value="",
                             scale=2,
-                            info="ISO code (e.g. en, es, zh, ja, ko, etc). See: docs/languages.md"
+                            info="Detected ISO (e.g. en, es). Auto-detected on manifest selection."
                         )
                         refresh_train_btn = gr.Button("🔄", scale=1, min_width=50)
 
                     with gr.Row():
                         val_manifest = gr.Dropdown(
-                            label="Validation Manifest (Optional)",
+                            label="Validation Manifest (val data.lst)",
                             choices=scan_datasets(),
                             value=None,
                             allow_custom_value=True,
-                            info="Optional validation manifest. Leave empty if not used.",
+                            info="Select a manifest from 'val/data.lst' folder.",
                             scale=8
                         )
                         refresh_val_btn = gr.Button("🔄", scale=1, min_width=50)
 
                     with gr.Row():
-                        vram_preset = gr.Radio(
+                        vram_preset = gr.Dropdown(
                             label="Target GPU VRAM (Auto-Config)",
-                            choices=["8 GB", "12 GB", "16 GB", "24 GB", "32 GB", "48 GB", "96 GB", "Small Dataset (Tuned - < 10 minutes)"],
+                            choices=["8 GB", "12 GB", "16 GB", "24 GB", "32 GB+"],
                             value="24 GB",
                             elem_classes="input-field",
-                            info="Select your GPU VRAM. 'Small Dataset' uses optimal anti-overfit parameters for small data. (You can adjust the preset settings to your liking below)"
+                            info="Select your GPU VRAM to calibrate the Max Tokens per Batch to avoid OOM errors.",
+                            scale=3
                         )
 
-                    with gr.Row():
-                        ds_info = gr.Markdown("📊 *Dataset Stats: Select a manifest to view stats.*")
+                    gr.Markdown("""
+                    💡 **Note:** These values are just a starting point and you can modify them manually below to your liking. 
+                    You can stop training at any time; just make sure to monitor the evaluation audios generated in TensorBoard to decide when the voice quality is ready.
+                    """)
 
                     with gr.Row():
                         output_name = gr.Dropdown(
@@ -1472,9 +1588,11 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                             value="",
                             allow_custom_value=True,
                             scale=8,
-                            info="Training results will be saved in exp/[name]. Selecting an existing folder will resume training."
+                            info="Training results will be saved in exp/[name]."
                         )
-                        refresh_out_btn = gr.Button("🔄", scale=1, min_width=50)
+                        with gr.Column(scale=1, min_width=50):
+                            refresh_out_btn = gr.Button("🔄", scale=1)
+                            delete_lora_btn = gr.Button("🗑️", scale=1, variant="stop")
                     
                     def refresh_manifests():
                         manifests = scan_datasets()
@@ -1487,13 +1605,38 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                     refresh_val_btn.click(refresh_manifests, outputs=[train_manifest, val_manifest])
                     refresh_out_btn.click(refresh_projects, outputs=[output_name])
 
+                    def detect_manifest_language(manifest_path):
+                        """Extracts language_id from the first shard of the dataset."""
+                        if not manifest_path:
+                            return ""
+                        
+                        try:
+                            # manifest_path is typically 'data/dataset_name/train/data.lst'
+                            manifest_file = project_root / manifest_path
+                            dataset_dir = manifest_file.parent.parent # -> data/dataset_name
+                            
+                            shard_file = dataset_dir / "train" / "txts" / "shard-000000.jsonl"
+                            
+                            if shard_file.exists():
+                                with open(shard_file, "r", encoding="utf-8") as f:
+                                    first_line = f.readline()
+                                    if first_line:
+                                        data = json.loads(first_line)
+                                        return data.get("language_id", "en")
+                        except Exception as e:
+                            print(f"Error detecting language: {e}")
+                        
+                        return "en" # Fallback to en
+
+                    train_manifest.change(detect_manifest_language, inputs=[train_manifest], outputs=[lang_code])
+
                     gr.Markdown("#### ⚙️ Core Hyperparameters")
 
                     with gr.Row():
                         lr = gr.Dropdown(
                             label="Learning Rate",
                             choices=["1e-3", "5e-4", "1e-4", "5e-5", "1e-5"],
-                            value="1e-4",
+                            value="1e-5",
                             allow_custom_value=True,
                             elem_classes="input-field",
                             info="Peak learning rate."
@@ -1507,7 +1650,7 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                         )
                         batch_tokens_num = gr.Dropdown(
                             label="Batch Tokens",
-                            choices=["1024", "2048", "4096", "8192", "16384", "32768", "65536"],
+                            choices=["64", "128", "256", "512", "768", "1024", "2048", "4096"],
                             value="4096",
                             allow_custom_value=True,
                             elem_classes="input-field",
@@ -1567,11 +1710,19 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                                 value="Qwen/Qwen3-0.6B",
                                 info="Local LLM path or HuggingFace ID."
                             )
-                            resume_checkpoint = gr.Textbox(
+                            resume_checkpoint = gr.Dropdown(
                                 label="Resume from Checkpoint Path",
-                                value="",
-                                placeholder="exp/omnivoice/checkpoint-100000",
+                                choices=["None"] + [c[0] if isinstance(c, tuple) else c for c in scan_lora_checkpoints(with_info=False)],
+                                value="None",
+                                allow_custom_value=True,
                                 info="If provided, resumes training from this local checkpoint directory."
+                            )
+                        with gr.Row():
+                            attn_impl_select = gr.Dropdown(
+                                label="Attention Implementation",
+                                choices=["flex_attention", "sdpa"],
+                                value="sdpa",
+                                info="Flex: Faster/Less VRAM (sm_80+). SDPA: Native fallback (Any GPU)."
                             )
 
                     with gr.Row():
@@ -1605,6 +1756,7 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                     eval_audio,
                     enable_eval,
                     lang_code,
+                    attn_impl_select,
                     warmup_ratio,
                     repeat_factor
                 ],
@@ -1616,112 +1768,62 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
             def on_auto_calc(manifest, vram):
                 count, total_dur, avg_dur, total_tokens = calculate_dataset_stats(manifest)
                 
-                # 1. Base Tuned Hyperparameters (Optimized for small-dataset stability)
-                lr = 1e-5
+                if count == 0:
+                    return [gr.update()] * 7 + [gr.update(value="Error: Train Manifest is empty or not selected.", visible=True)]
+                    
+                duration_mins = total_dur / 60.0
+                
+                # Fixed Small-Dataset Recipe to avoid catastrophic overfitting
+                new_lr = "1e-5"
                 repeat = 3
                 warmup = 0.05
-                save_steps = 100
+                interval = 200
+                target_steps = 2000
                 
-                # 2. VRAM Scaling (Targeting 4096+ tokens if possible)
-                # Note: tokens reduced by ~12% for each level to provide safety margin (OOM protection)
+                # VRAM Scaling (Adjust only max batch_tokens to prevent OOM)
+                # Keep gradient accumulation at 2 as per recipe
+                accum = 2
+                
                 if "8 GB" in vram:
-                    tokens = 896
-                    accum = 10
+                    tokens = 512
                 elif "12 GB" in vram:
-                    tokens = 1344
-                    accum = 8
+                    tokens = 768
                 elif "16 GB" in vram:
-                    tokens = 1792
-                    accum = 6
-                elif "24 GB" in vram or "Small Dataset" in vram:
-                    tokens = 3584
-                    accum = 2
-                elif "32 GB" in vram:
-                    tokens = 7168
-                    accum = 1
-                elif "48 GB" in vram:
-                    tokens = 28672
-                    accum = 1
-                elif "96 GB" in vram:
-                    tokens = 57344
-                    accum = 1
+                    tokens = 1024
+                elif "24 GB" in vram:
+                    tokens = 2048
                 else:
+                    # For 32GB+
                     tokens = 4096
-                    accum = 2
 
-                # 3. Blended Dataset & VRAM Scaling
-                # Effective Batch Size (EBS)
-                ebs = tokens * accum
-                ebs_factor = ebs / 4096.0 # 4096 is the ebs for the "Small Dataset" recipe
-                
-                hours = total_dur / 3600 if total_dur > 0 else (count * 5.0) / 3600
-                
-                if hours < 0.166: # < 10 minutes (Ultra-Stable Recipe Base)
-                    lr_base = 1e-5
-                    repeat = 3
-                    save_steps = 100
-                    warmup = 0.05
-                else:
-                    # Exponential growth based on data volume
-                    # We grow from 1e-5 towards ~1e-4 based on hours
-                    lr_base = 1e-5 * (2**(hours / 5.0)) # Double LR every 5 hours of data
-                    lr_base = min(lr_base, 1e-4) # Base cap before VRAM scaling
-                    
-                    if hours < 1:
-                        repeat = 2
-                        save_steps = 150
-                    elif hours < 10:
-                        repeat = 1
-                        save_steps = 250
-                    else:
-                        repeat = 1
-                        save_steps = 500
-                        warmup = 0.01 # Standard warmup for larger data
 
-                # Final LR scaled by effective batch size (Linear Scaling Rule)
-                lr = lr_base * ebs_factor
-                lr = max(1e-6, min(lr, 5e-4)) # Safety training bounds
+                return [
+                    gr.update(value=float(new_lr)),
+                    gr.update(value=target_steps),
+                    gr.update(value=tokens),
+                    gr.update(value=accum),
+                    gr.update(value=interval),
+                    gr.update(value=warmup),
+                    gr.update(value=repeat)
+                ]
 
-                # 4. Step Calculation (Independent of VRAM choice)
-                # Calculates steps based on a virtual standard batch of 8192 tokens.
-                # VRAM only scales the internal batch_tokens/accum, not the total updates.
-                avg_tokens_per_sample = total_tokens / count if count > 0 else 1000
-                if avg_tokens_per_sample < 200: avg_tokens_per_sample = 200
-                
-                virtual_batch = 8192 
-                samples_per_virtual_step = virtual_batch / avg_tokens_per_sample
-                if samples_per_virtual_step < 1: samples_per_virtual_step = 1
-                
-                suggested_steps = int((count * repeat) / samples_per_virtual_step)
-                
-                if hours < 0.166:
-                    total_steps = max(min(suggested_steps, 800), 100)
-                elif hours < 1:
-                    total_steps = max(min(suggested_steps, 2000), 500)
-                else:
-                    total_steps = max(suggested_steps, 1500)
-                
-                total_steps = min(total_steps, 300000)
-
-                # Format info string
-                minutes = total_dur / 60 if total_dur > 0 else (count * 5.0) / 60
-                info = f"📊 **Stats:** {count} clips | ~{minutes:.1f} min total | ~{total_tokens:,} tokens | Avg: {avg_dur:.1f}s\n"
-                info += f"🪄 **Auto-Scaling:** {tokens*accum} batch layout ({vram}) | {repeat}x repeat | Steps: {total_steps}"
-                if count < 50:
-                    info += "\n⚠️ **Caution:** Tiny dataset found! Using ultra-stable parameters."
-
-                lr_str = f"{lr:.0e}".replace("e-05", "e-5").replace("1e-04", "1e-4").replace("5e-05", "5e-5")
-                return str(tokens), int(accum), lr_str, int(total_steps), int(save_steps), float(warmup), int(repeat), info
+            delete_lora_btn.click(
+                fn=delete_lora_folder,
+                inputs=[output_name],
+                outputs=[output_name, logs_out]
+            )
 
             vram_preset.change(
                 on_auto_calc,
                 inputs=[train_manifest, vram_preset],
-                outputs=[batch_tokens_num, grad_accum, lr, steps_num, save_steps, warmup_ratio, repeat_factor, ds_info]
+                outputs=[lr, steps_num, batch_tokens_num, grad_accum, save_steps, warmup_ratio, repeat_factor]
             )
+            
+            # Also update when manifest is selected
             train_manifest.change(
                 on_auto_calc,
                 inputs=[train_manifest, vram_preset],
-                outputs=[batch_tokens_num, grad_accum, lr, steps_num, save_steps, warmup_ratio, repeat_factor, ds_info]
+                outputs=[lr, steps_num, batch_tokens_num, grad_accum, save_steps, warmup_ratio, repeat_factor]
             )
 
             # --- Final Cross-Tab Event Handlers ---

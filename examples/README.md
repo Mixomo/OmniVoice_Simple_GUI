@@ -96,6 +96,8 @@ Main difference between fine-tuning config ([config/train_config_finetune.json](
 
 To use a different pretrained checkpoint, modify `init_from_checkpoint` in the config file.
 
+If you encounter issues with `flex_attention` on your GPU, use [config/train_config_finetune_sdpa.json](config/train_config_finetune_sdpa.json) instead, which uses SDPA attention for broader compatibility. See [docs/training.md](../docs/training.md#attention-implementation) for details.
+
 ---
 
 ## Evaluation

@@ -76,18 +76,23 @@ class TrainingConfig:
     allow_tf32: bool = True
     use_deepspeed: bool = False
     deepspeed_config: Optional[str] = None
+    attn_implementation: str = "flex_attention"
 
-    # Logging
+    # Length-grouped batching (only used when attn_implementation != "flex_attention")
+    max_sample_tokens: int = 2000
+    min_sample_tokens: int = 50
+    max_batch_size: int = 64
+
+    # Logging & Evaluation
     logging_steps: int = 100
     eval_steps: int = 1000
     save_steps: int = 10000
-    use_compile: bool = False
-    
-    # Evaluation (Tensorboard Samples)
-    enable_eval: bool = True
-    eval_text: str = "This is a progress update. I am learning to speak better with every checkpoint."
-    eval_ref_audio: Optional[str] = None
     keep_last_n_checkpoints: int = -1
+    
+    # Audio Evolution Logging
+    enable_eval: bool = True
+    eval_text: str = "This is a test of the OmniVoice system."
+    eval_ref_audio: Optional[str] = None
 
     @classmethod
     def from_json(cls, json_path: str):

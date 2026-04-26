@@ -31,13 +31,24 @@ See examples/run_emilia.sh and examples/run_finetune.sh for full pipelines.
 """
 
 import argparse
+import logging
+import os
+
+# Set PyTorch allocation conf to prevent VRAM fragmentation / memory leaks
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from omnivoice.training.builder import build_dataloaders, build_model_and_tokenizer
 from omnivoice.training.config import TrainingConfig
 from omnivoice.training.trainer import OmniTrainer
+from omnivoice.utils.windows_patch import apply_triton_windows_patch, apply_flex_attention_patch
+
+logger = logging.getLogger(__name__)
 
 
 def main():
+    # Apply critical Windows patches before anything else
+    apply_triton_windows_patch()
+
     parser = argparse.ArgumentParser(description="OmniVoice Training Entry Point")
     parser.add_argument(
         "--train_config", type=str, required=True, help="Path to config JSON"
@@ -55,11 +66,15 @@ def main():
     config.output_dir = args.output_dir
     config.data_config = args.data_config
 
-    # 2. Build Components
+    # 2. Apply flex_attention Ampere/Ada patch BEFORE model init (only when needed)
+    if config.attn_implementation == "flex_attention":
+        apply_flex_attention_patch()
+
+    # 3. Build Components
     model, tokenizer = build_model_and_tokenizer(config)
     train_loader, eval_loader = build_dataloaders(config, tokenizer)
 
-    # 3. Initialize Trainer and Start
+    # 4. Initialize Trainer and Start
     trainer = OmniTrainer(
         model=model,
         config=config,

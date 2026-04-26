@@ -12,6 +12,47 @@ A comprehensive and optimized WebUI for working with **OmniVoice** on Windows. T
 
 <img src="./assets/training_tab.png">
 
+### 2026-04-26 - Stability & Democratization Update: Pascal Support & VRAM Fixes
+This massive update focuses on making OmniVoice stable for long training sessions and accessible to a wider range of NVIDIA GPUs:
+
+*   **VRAM Leak Resolution**: 
+    *   Forced **PyTorch 2.7.1** downgrade to eliminate memory leaks present in newer versions.
+    *   Enabled `expandable_segments` memory allocator and deep VRAM purging (CPU offloading before deletion) in both inference and training.
+*   **OmniTrainer 2.0**:
+    *   **Infinite Dataloader**: Replaced epoch-based resetting with a linear "infinite" stream to prevent training stalls.
+    *   **Safe Evaluation**: Implemented model-only offloading during validation to preserve optimizer state in VRAM, preventing fragmentation.
+    *   **RNG Persistence**: Fixed random state handling so validation samples no longer disrupt training reproducibility.
+*   **Hardware Democratization & Flex Attention**:
+    *   **Architecture-Aware Patching**: Implemented a Compute Capability detection system. **Ampere (RTX 30)** and **Ada (RTX 40)** GPUs have a physical **99KB shared memory limit** per block.
+    *   **32x32 Block Fix**: We force 32x32 blocks during training for these architectures to prevent `CUDA illegal memory access` errors that occur when PyTorch attempts to use default 128x128 blocks.
+    *   **Unrestricted Inference**: The patch is automatically disabled during inference to regain maximum speed with large blocks, as shared memory is not saturated without gradient calculations.
+    *   **Pascal Support (10-Series)**: Auto-detects legacy GPUs to install **PyTorch 2.6.0 + CUDA 12.6**, maintaining compatibility where newer versions fail.
+*   **Enhanced UI & UX**:
+    *   **Smart Hyperparameter Recipe**: Replaced old heuristics with a "Small-Dataset" tuned config (LR 1e-5, Accum 2) that avoids catastrophic overfitting.
+    *   **Reactive VRAM Presets**: Choosing a VRAM preset (8GB to 32GB+) now instantly updates all parameters without extra clicks.
+    *   **Dynamic Checkpoint Resume**: Replaced the manual path textbox with a searchable dropdown of existing projects and checkpoints.
+*   **Robust Windows Support**:
+    *   Fixed multiprocessing `PicklingError` in Windows DataLoaders.
+    *   Patched Triton/Inductor `CompiledKernel` hooks for stable Windows execution.
+    *   Improved **TensorBoard** integration with automatic port cleanup and visible console logging.
+
+## 🛠️ Windows Deep-Dive: The `windows_patch.py` System
+To enable high-performance features like **Flex Attention** and **Triton compilation** on Windows, we implement a series of low-level monkey-patches in `omnivoice/utils/windows_patch.py`. Here is a breakdown of every fix applied:
+
+### 1. `apply_triton_windows_patch()`: Bridging the OS Gap
+Triton is natively built for Linux. Windows wheels (like `triton-windows`) often lack specific metadata or hooks that PyTorch Inductor expects.
+*   **Metadata Injection (`make_launcher`)**: We patch `TritonCompileResult.make_launcher` to intercept the kernel binary. It manually injects `cluster_dims` and `num_ctas` into the `binary.metadata` if they are missing. Without this, the compiler throws an `AttributeError` because it expects these fields for hardware synchronization.
+*   **CompiledKernel Hooks**: In PyTorch 2.6/2.7, Inductor looks for `launch_enter_hook` and `launch_exit_hook` on the `CompiledKernel` class. Since these are often absent in Windows Triton builds, we inject dummy lambda functions to prevent a crash during the kernel launch phase.
+
+### 2. `apply_flex_attention_patch()`: Overcoming Hardware Limits
+Standard Flex Attention kernels are optimized for A100/H100 GPUs with large shared memory. Consumer cards have a **99KB shared memory limit** per block.
+*   **Architecture Detection**: The patch uses `torch.cuda.get_device_capability()` to target **Ampere (8.6)** and **Ada (8.9)** GPUs specifically.
+*   **Kernel Option Overrides**: It wraps `compile_friendly_flex_attention` to force `BLOCK_M=32` and `BLOCK_N=32`. 
+*   **The Rationale**: Default 128x128 blocks require >100KB of shared memory during training (due to gradient overhead). Forcing 32x32 blocks reduces shared memory pressure to ~40KB, allowing training to run stably without `CUDA Error: illegal memory access`.
+
+### 3. `patch_triton_key()`: Cache & Hash Stability
+*   This patch modifies the internal hashing mechanism used by Inductor to identify Triton kernels. It ensures that `num_ctas` is always present in the signature, preventing cache misses and "KeyError" crashes when the compiler tries to retrieve a compiled kernel from the local disk cache on Windows.
+
 ### 2026-04-24 - Add Dialogue Builder - Multi Speaker Support Inference
 We've introduced a **Dialogue Builder** sub-tab within the Voice Clone interface, designed for creating multi-speaker interactions easily:
 

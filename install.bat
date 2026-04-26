@@ -24,7 +24,11 @@ if %errorlevel% equ 0 (
     set "PATH=%USERPROFILE%\.cargo\bin;%APPDATA%\uv\bin;%PATH%"
 )
 
-:: 4. Run uv sync
+:: 4. Detect GPU and Patch Environment for Pascal/Older GPUs
+echo [INFO] Detecting GPU to select optimal PyTorch version...
+uv run python patch_env.py
+
+:: 5. Run uv sync
 echo [INFO] Running 'uv sync'...
 uv sync
 
