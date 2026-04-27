@@ -93,6 +93,8 @@ class TrainingConfig:
     enable_eval: bool = True
     eval_text: str = "This is a test of the OmniVoice system."
     eval_ref_audio: Optional[str] = None
+    eval_ref_text: Optional[str] = None
+
 
     @classmethod
     def from_json(cls, json_path: str):

@@ -234,6 +234,16 @@ def recognize_audio(audio_path, whisper_model="large-v3 (~10 GB VRAM)", language
         print(f"ASR Error: {e}", file=sys.stderr)
         return "", None
 
+def transcribe_audio_ui(audio_path, model_name, language):
+    if not audio_path:
+        return "Please upload an audio file first."
+    try:
+        text, _ = recognize_audio(audio_path, model_name, language)
+        return text
+    except Exception as e:
+        return f"Error: {e}"
+
+
 def scan_datasets():
     datasets_root = project_root / "data"
     if not datasets_root.exists():
@@ -586,7 +596,8 @@ def run_inference(text, ref_audio, ref_text, model_selection, cfg_scale, steps, 
             return None, f"Triton/Compiler Error: {err_msg}. Please try switching Attention Implementation to 'sdpa' in Optimization settings."
         return None, f"Error: {err_msg}"
 
-def start_training(model_choice, train_manifest, val_manifest, output_name, lr, steps, batch_tokens, llm_name, resume_checkpoint, grad_accum, save_steps, eval_text, eval_audio, enable_eval, lang_code, attn_impl, warmup_ratio=0.01, repeat_factor=1):
+def start_training(model_choice, train_manifest, val_manifest, output_name, lr, steps, batch_tokens, llm_name, resume_checkpoint, grad_accum, save_steps, eval_text, eval_audio, eval_ref_text, enable_eval, lang_code, attn_impl, warmup_ratio=0.01, repeat_factor=1):
+
     global training_process
     if training_process and training_process.poll() is None:
         print("Training is already running.", file=sys.stderr)
@@ -621,9 +632,11 @@ def start_training(model_choice, train_manifest, val_manifest, output_name, lr, 
         "init_from_checkpoint": OMNIVOICE_MODELS.get(model_choice, "k2-fsa/OmniVoice"),
         "eval_text": eval_text.strip() if eval_text else "I am training and getting better every day.",
         "eval_ref_audio": final_eval_audio,
+        "eval_ref_text": eval_ref_text.strip() if eval_ref_text else None,
         "enable_eval": bool(enable_eval),
         "attn_implementation": attn_impl
     }
+
 
     # Auto-adjust num_workers based on shard count (Recipe: num_workers <= shard count)
     try:
@@ -1702,6 +1715,14 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                             label="Inference Reference Audio",
                             type="filepath"
                         )
+                        eval_transcribe_btn = gr.Button("🎙️ Transcribe Reference", variant="secondary", size="sm")
+                        eval_ref_text = gr.Textbox(
+                            label="Reference Text / Transcription",
+                            placeholder="Manually transcribe or use the button above to avoid ASR in training.",
+                            lines=2,
+                            interactive=True
+                        )
+
 
                     with gr.Accordion("🔧 Advanced Settings", open=False, elem_classes="accordion"):
                         with gr.Row():
@@ -1754,6 +1775,7 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                     save_steps,
                     eval_text,
                     eval_audio,
+                    eval_ref_text,
                     enable_eval,
                     lang_code,
                     attn_impl_select,
@@ -1762,6 +1784,13 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                 ],
                 outputs=[logs_out],
             )
+
+            eval_transcribe_btn.click(
+                fn=transcribe_audio_ui,
+                inputs=[eval_audio, infer_whisper_model, infer_whisper_lang],
+                outputs=[eval_ref_text]
+            )
+
             stop_btn.click(stop_training, outputs=[logs_out])
             tb_btn.click(launch_tensorboard, inputs=[output_name], outputs=[logs_out])
 

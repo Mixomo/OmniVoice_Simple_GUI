@@ -99,6 +99,35 @@ class OmniTrainer:
         if self.eval_dataloader is not None:
             self.eval_dataloader = self.accelerator.prepare(self.eval_dataloader)
             
+        # 5. Pre-load tokenizers for Evolution Audio (to avoid memory corruption/shuffling later)
+        if self.accelerator.is_main_process and getattr(self.config, "enable_eval", True):
+            try:
+                from omnivoice.models.omnivoice import _resolve_model_path
+                from transformers import AutoTokenizer, HiggsAudioV2TokenizerModel, AutoFeatureExtractor
+                
+                logger.info("📡 Pre-loading tokenizers for Evolution Audio...")
+                base_path = getattr(self.config, "init_from_checkpoint", None) or "k2-fsa/OmniVoice"
+                resolved_path = _resolve_model_path(base_path)
+                
+                # Keep them on CPU permanently
+                self._val_text_tokenizer = AutoTokenizer.from_pretrained(resolved_path)
+                
+                audio_tokenizer_path = os.path.join(resolved_path, "audio_tokenizer")
+                if not os.path.isdir(audio_tokenizer_path):
+                    from omnivoice.models.omnivoice import _resolve_model_path as _res
+                    audio_tokenizer_path = _res("eustlb/higgs-audio-v2-tokenizer")
+                
+                self._val_audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(audio_tokenizer_path, device_map="cpu")
+                self._val_feature_extractor = AutoFeatureExtractor.from_pretrained(audio_tokenizer_path)
+                self._val_sampling_rate = self._val_feature_extractor.sampling_rate
+                
+                from omnivoice.utils.duration import RuleDurationEstimator
+                self._val_duration_estimator = RuleDurationEstimator()
+                logger.info("✅ Tokenizers loaded and ready on CPU.")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not pre-load tokenizers: {e}")
+
+            
         self.global_step = 0
         self.epoch = 0
 
@@ -361,21 +390,28 @@ class OmniTrainer:
     def log_validation_sample(self, step: int):
         """Logs a real audio inference sample to Tensorboard.
 
-        Strategy: offload ONLY the training model weights to CPU (NOT the
-        optimizer state, which causes severe VRAM fragmentation when moved).
-        Load a lightweight inference model, generate one sample, delete it,
-        then restore training weights to GPU.
+        Strategy: Use the existing model directly on its current device (usually GPU).
+        This avoids the unstable "memory shuffle" (to CPU and back) that causes 
+        double frees and RAM leaks in long training sessions.
         """
         if not self.accelerator.is_main_process or not self.config.enable_eval:
             return
 
         logger.info(f"🎨 Generating Evolution Audio at step {step}...")
 
-        checkpoint_dir = os.path.join(self.config.output_dir, f"checkpoint-{step}")
-        if not os.path.exists(checkpoint_dir):
+        # 1. Ensure tokenizers are attached (they should be pre-loaded)
+        model_unwrapped = self.accelerator.unwrap_model(self.model)
+        if getattr(self, "_val_audio_tokenizer", None) is not None:
+            model_unwrapped.text_tokenizer = self._val_text_tokenizer
+            model_unwrapped.audio_tokenizer = self._val_audio_tokenizer
+            model_unwrapped.feature_extractor = self._val_feature_extractor
+            model_unwrapped.sampling_rate = self._val_sampling_rate
+            model_unwrapped.duration_estimator = self._val_duration_estimator
+        else:
+            logger.warning("⚠️ Tokenizers not available for validation.")
             return
 
-        # 1. Save all RNG states so eval doesn't affect training reproducibility
+        # 2. Save all RNG states so eval doesn't affect training reproducibility
         rng_states = {
             "torch": torch.get_rng_state(),
             "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
@@ -383,41 +419,30 @@ class OmniTrainer:
             "python": random.getstate(),
         }
 
-        original_device = self.accelerator.device
-        model_unwrapped = self.accelerator.unwrap_model(self.model)
-
         try:
-            # 2. Offload training model weights to CPU (optimizer stays on GPU)
-            model_unwrapped.to("cpu")
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            # 3. Load inference model
-            from omnivoice.models.omnivoice import OmniVoice
-
-            inf_model = OmniVoice.from_pretrained(
-                checkpoint_dir,
-                attn_implementation="eager",  # Safe on all platforms
-                dtype=torch.float32,
-            )
-            inf_model.to(original_device)
+            # 3. Use the existing model instead of reloading from disk
+            inf_model = model_unwrapped
+            inf_model.eval()
 
             # 4. Generate with fixed seed
             torch.manual_seed(42)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(42)
             np.random.seed(42)
             random.seed(42)
 
             gen_text = self.config.eval_text
             ref_audio = self.config.eval_ref_audio
+            eval_ref_text = getattr(self.config, "eval_ref_text", None)
 
             final_ref = None
             if ref_audio and os.path.exists(ref_audio):
                 final_ref = ref_audio
             elif self.eval_dataloader is not None:
                 try:
-                    raw_reader = self.eval_dataloader.dataset.dataset
+                    raw_reader = self.eval_dataloader.dataset
                     sample = next(iter(raw_reader))
-                    final_ref = (sample["audio"][0].cpu(), self.model.sampling_rate)
+                    final_ref = (sample["audio"][0].cpu(), model_unwrapped.sampling_rate)
                     logger.info("Using automatic sample from evaluation set.")
                 except Exception:
                     pass
@@ -425,11 +450,15 @@ class OmniTrainer:
             gen_kwargs = {"text": gen_text, "num_step": 32}
             if final_ref is not None:
                 gen_kwargs["ref_audio"] = final_ref
+                # Use manual transcription if provided, otherwise a placeholder
+                # to avoid triggering the heavy Whisper ASR download!
+                gen_kwargs["ref_text"] = eval_ref_text or "Reference audio."
 
             with torch.inference_mode():
+                # Generate directly on the current device
                 audios = inf_model.generate(**gen_kwargs)
 
-            # Convert to numpy immediately to detach from GPU graph
+            # Convert to numpy immediately
             audio_np = audios[0]
             if isinstance(audio_np, torch.Tensor):
                 audio_np = audio_np.detach().cpu().numpy()
@@ -441,33 +470,25 @@ class OmniTrainer:
                         "val/audio_evolution",
                         audio_np,
                         global_step=step,
-                        sample_rate=inf_model.sampling_rate,
+                        sample_rate=model_unwrapped.sampling_rate,
                     )
 
             logger.info(f"✅ Audio evolution logged to Tensorboard at step {step}")
 
-            # 6. Cleanup inference model
-            if hasattr(inf_model, "to"):
-                inf_model.to("cpu")
-            del inf_model
+            # 6. Cleanup
             del audios
             del audio_np
             gc.collect()
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         except Exception as e:
-            logger.warning(f"❌ Failed to generate evolution audio: {e}")
-
+            logger.error(f"❌ Failed to generate evolution audio: {e}")
         finally:
-            # 7. Restore training model to GPU
-            try:
-                model_unwrapped.to(original_device)
-            except Exception as re:
-                logger.error(f"CRITICAL: Failed to restore model to GPU: {re}")
-
+            # Restore model to training mode
             self.model.train()
 
-            # 8. Restore RNG states
+            # 7. Restore RNG states
             torch.set_rng_state(rng_states["torch"])
             if rng_states["cuda"] is not None:
                 torch.cuda.set_rng_state(rng_states["cuda"])
@@ -475,4 +496,6 @@ class OmniTrainer:
             random.setstate(rng_states["python"])
 
             gc.collect()
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
