@@ -1,6 +1,7 @@
 # 🎙️ OmniVoice Simple GUI: Unified Voice Cloning & Fine-Tuning
 
-A comprehensive and optimized WebUI for working with **OmniVoice** on Windows. This application provides a seamless pipeline for dataset preparation, model training (LoRA), and high-quality voice synthesis.
+A comprehensive and optimized WebUI for working with **OmniVoice** on Linux/WSL. This application provides a seamless pipeline for dataset preparation, model training (LoRA), and high-quality voice synthesis.
+
 
 ---
 
@@ -31,27 +32,7 @@ This massive update focuses on making OmniVoice stable for long training session
     *   **Smart Hyperparameter Recipe**: Replaced old heuristics with a "Small-Dataset" tuned config (LR 1e-5, Accum 2) that avoids catastrophic overfitting.
     *   **Reactive VRAM Presets**: Choosing a VRAM preset (8GB to 32GB+) now instantly updates all parameters without extra clicks.
     *   **Dynamic Checkpoint Resume**: Replaced the manual path textbox with a searchable dropdown of existing projects and checkpoints.
-*   **Robust Windows Support**:
-    *   Fixed multiprocessing `PicklingError` in Windows DataLoaders.
-    *   Patched Triton/Inductor `CompiledKernel` hooks for stable Windows execution.
-    *   Improved **TensorBoard** integration with automatic port cleanup and visible console logging.
 
-## 🛠️ Windows Deep-Dive: The `windows_patch.py` System
-To enable high-performance features like **Flex Attention** and **Triton compilation** on Windows, we implement a series of low-level monkey-patches in `omnivoice/utils/windows_patch.py`. Here is a breakdown of every fix applied:
-
-### 1. `apply_triton_windows_patch()`: Bridging the OS Gap
-Triton is natively built for Linux. Windows wheels (like `triton-windows`) often lack specific metadata or hooks that PyTorch Inductor expects.
-*   **Metadata Injection (`make_launcher`)**: We patch `TritonCompileResult.make_launcher` to intercept the kernel binary. It manually injects `cluster_dims` and `num_ctas` into the `binary.metadata` if they are missing. Without this, the compiler throws an `AttributeError` because it expects these fields for hardware synchronization.
-*   **CompiledKernel Hooks**: In PyTorch 2.6/2.7, Inductor looks for `launch_enter_hook` and `launch_exit_hook` on the `CompiledKernel` class. Since these are often absent in Windows Triton builds, we inject dummy lambda functions to prevent a crash during the kernel launch phase.
-
-### 2. `apply_flex_attention_patch()`: Overcoming Hardware Limits
-Standard Flex Attention kernels are optimized for A100/H100 GPUs with large shared memory. Consumer cards have a **99KB shared memory limit** per block.
-*   **Architecture Detection**: The patch uses `torch.cuda.get_device_capability()` to target **Ampere (8.6)** and **Ada (8.9)** GPUs specifically.
-*   **Kernel Option Overrides**: It wraps `compile_friendly_flex_attention` to force `BLOCK_M=32` and `BLOCK_N=32`. 
-*   **The Rationale**: Default 128x128 blocks require >100KB of shared memory during training (due to gradient overhead). Forcing 32x32 blocks reduces shared memory pressure to ~40KB, allowing training to run stably without `CUDA Error: illegal memory access`.
-
-### 3. `patch_triton_key()`: Cache & Hash Stability
-*   This patch modifies the internal hashing mechanism used by Inductor to identify Triton kernels. It ensures that `num_ctas` is always present in the signature, preventing cache misses and "KeyError" crashes when the compiler tries to retrieve a compiled kernel from the local disk cache on Windows.
 
 ### 2026-04-24 - Add Dialogue Builder - Multi Speaker Support Inference
 We've introduced a **Dialogue Builder** sub-tab within the Voice Clone interface, designed for creating multi-speaker interactions easily:
@@ -78,9 +59,10 @@ The GUI is designed around a 4-step logical workflow:
 ## ⚙️ System Requirements & Hardware
 
 ### 💻 Software Dependencies
-*   **OS:** Windows 10/11.
+*   **OS:** Linux (Ubuntu recommended) / WSL2.
 *   **Python:** 3.10 – 3.11.
 *   **Cuda:** 12.1+ recommended.
+
 *   **VRAM Management:** The UI includes safety margins for all presets to prevent OOM errors during training.
 
 ### 🔌 Hardware Setup (VRAM Estimates)
@@ -109,21 +91,43 @@ The GUI is designed around a 4-step logical workflow:
 
 ---
 
-## 🛠️ Installation & Execution (Windows)
+## 🛠️ Installation & Execution
+
+This project uses `uv` for high-performance dependency management.
+
+### Clone the repository:
+
+```bash
+git clone https://github.com/Mixomo/OmniVoice_Simple_GUI.git
+cd OmniVoice_Simple_GUI
+```
+
+## 🛠️ Installation & Execution (Linux/WSL)
 
 This project uses `uv` for high-performance dependency management.
 
 ## Clone the repository:
 
 ```bash
-git clone https://github.com/Mixomo/OmniVoice_Simple_GUI.git
+git clone -b main_linux https://github.com/Mixomo/OmniVoice_Simple_GUI.git
+```
+
+## Give scripts execute permissions:
+
+```bash
+chmod +x install.sh start.sh
 ```
 
 ### Setup Steps
-1.  **Run Installer:** Double-click `install.bat`.
-    * This installs `uv` via Winget (if not present).
-    * Synchronizes the environment and installs all required libraries automatically.
-2.  **Launch App:** Double-click `start.bat`.
+1.  **Run Installer:** Execute the installation script in your terminal:
+    ```bash
+    ./install.sh
+    ```
+    * This installs `uv` (if not present) and synchronizes the environment automatically.
+2.  **Launch App:** Start the WebUI:
+    ```bash
+    ./start.sh
+    ```
 3.  **Access:** Navigate to `http://127.0.0.1:7860` in your web browser.
 
 ---
@@ -131,4 +135,3 @@ git clone https://github.com/Mixomo/OmniVoice_Simple_GUI.git
 Inspired by [FranckyB](https://github.com/FranckyB) [Voice Clone Studio](https://github.com/FranckyB/Voice-Clone-Studio)
 
 Based on [OmniVoice](https://github.com/k2-fsa/OmniVoice) by [K2-FSA](https://github.com/k2-fsa)
-

@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import signal
 
 # Set PyTorch allocation conf to prevent VRAM fragmentation / memory leaks
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -13,8 +14,8 @@ import random
 import datetime
 from pathlib import Path
 from typing import Optional
-import winsound
 import math
+
 
 import gradio as gr
 import numpy as np
@@ -83,11 +84,50 @@ def unload_omnivoice():
             torch.cuda.empty_cache()
 
 def play_done_chime():
+    """
+    Plays a notification sound when a task finishes.
+    Uses multiple fallbacks to ensure compatibility across Windows and Linux.
+    """
     chime_path = project_root / "assets" / "inference_training_done.wav"
-    if chime_path.exists():
+    
+    # 1. Try system-specific CLI players (Linux/WSL/Mac)
+    # List of common players and their arguments
+    players = [
+        ["paplay", str(chime_path)],     # PulseAudio
+        ["aplay", "-q", str(chime_path)], # ALSA
+        ["pw-play", str(chime_path)],    # PipeWire
+        ["canberra-gtk-play", "-f", str(chime_path)]
+    ]
+    
+    # Also try some standard system sounds if the chime_path doesn't exist or fails
+    test_sounds = [
+        "/usr/share/sounds/alsa/Front_Center.wav",
+        "/usr/share/sounds/freedesktop/stereo/complete.oga",
+        "/usr/share/sounds/gnome/default/alerts/glass.ogg"
+    ]
+    
+    for cmd in players:
         try:
-            winsound.PlaySound(str(chime_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
-        except: pass
+            if shutil.which(cmd[0]):
+                subprocess.Popen(cmd, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                return
+        except:
+            continue
+
+    # Try playing system sounds if available
+    if shutil.which("aplay"):
+        for s in test_sounds:
+            if os.path.exists(s):
+                try:
+                    subprocess.Popen(["aplay", "-q", s], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return
+                except: pass
+
+    # 2. Ultimate Fallback: Terminal Bell (\a)
+    print("\a", end="", flush=True)
+
+
+
 
 def load_omnivoice(checkpoint, attn_implementation="sdpa"):
     global current_model, current_checkpoint
@@ -208,7 +248,7 @@ def load_sample(sample_name):
     return str(audio_path.absolute()), text
 
 def save_prep_sample(audio_path, sample_name, transcription):
-    if not audio_path or not sample_name: return "Error: Missing data."
+    if not audio_path or not sample_name: return "Error: Missing data"
     samples_dir = project_root / "samples"
     os.makedirs(samples_dir, exist_ok=True)
     ext = os.path.splitext(audio_path)[1] or ".wav"
@@ -221,6 +261,18 @@ def save_prep_sample(audio_path, sample_name, transcription):
     with open(dest_json, "w", encoding="utf-8") as f: json.dump({"text": transcription}, f, ensure_ascii=False)
     
     return f"Sample '{sample_name}' saved successfully (Audio + JSON + TXT)!"
+
+def transcribe_audio_ui(audio_path, model_name, language):
+    if not audio_path:
+        return "Please upload an audio file first."
+    try:
+        asr = get_or_load_asr_model(model_name)
+        lang_code = WHISPER_LANGS.get(language)
+        segments, info = asr.transcribe(audio_path, language=lang_code, beam_size=5)
+        text = "".join([s.text for s in segments]).strip()
+        return text
+    except Exception as e:
+        return f"Error: {e}"
 
 def recognize_audio(audio_path, whisper_model="large-v3 (~10 GB VRAM)", language="Auto-detect"):
     if not audio_path: return "", None
@@ -268,6 +320,7 @@ def scan_lora_checkpoints(with_info=False):
         weight_files = ["model.safetensors", "pytorch_model.bin", "adapter_model.bin", "adapter_model.safetensors"]
         if any(f in files for f in weight_files):
             rel_path = os.path.relpath(root, project_root).replace("\\", "/")
+
             if with_info:
                 # Try to label it based on if it's an adapter or full model
                 label = "Trained LoRA" if "adapter_model.bin" in files or "adapter_model.safetensors" in files else ""
@@ -586,7 +639,8 @@ def run_inference(text, ref_audio, ref_text, model_selection, cfg_scale, steps, 
             return None, f"Triton/Compiler Error: {err_msg}. Please try switching Attention Implementation to 'sdpa' in Optimization settings."
         return None, f"Error: {err_msg}"
 
-def start_training(model_choice, train_manifest, val_manifest, output_name, lr, steps, batch_tokens, llm_name, resume_checkpoint, grad_accum, save_steps, eval_text, eval_audio, enable_eval, lang_code, attn_impl, warmup_ratio=0.01, repeat_factor=1):
+def start_training(model_choice, train_manifest, val_manifest, output_name, lr, steps, batch_tokens, llm_name, resume_checkpoint, grad_accum, save_steps, eval_text, eval_audio, eval_ref_text, enable_eval, lang_code, attn_impl, warmup_ratio=0.01, repeat_factor=1):
+
     global training_process
     if training_process and training_process.poll() is None:
         print("Training is already running.", file=sys.stderr)
@@ -621,9 +675,11 @@ def start_training(model_choice, train_manifest, val_manifest, output_name, lr, 
         "init_from_checkpoint": OMNIVOICE_MODELS.get(model_choice, "k2-fsa/OmniVoice"),
         "eval_text": eval_text.strip() if eval_text else "I am training and getting better every day.",
         "eval_ref_audio": final_eval_audio,
+        "eval_ref_text": eval_ref_text.strip() if eval_ref_text else None,
         "enable_eval": bool(enable_eval),
         "attn_implementation": attn_impl
     }
+
 
     # Auto-adjust num_workers based on shard count (Recipe: num_workers <= shard count)
     try:
@@ -639,9 +695,7 @@ def start_training(model_choice, train_manifest, val_manifest, output_name, lr, 
     except:
         train_config["num_workers"] = 0
 
-    if os.name == 'nt' and train_config["num_workers"] > 1:
-        # On Windows, more than 1 worker can sometimes be unstable with WebDataset/PyTorch
-        train_config["num_workers"] = 1
+
 
     
     if resume_checkpoint and resume_checkpoint.strip() and resume_checkpoint != "None":
@@ -688,11 +742,13 @@ def start_training(model_choice, train_manifest, val_manifest, output_name, lr, 
     print(f"Starting training...\nCommand: {' '.join(cmd)}\n", file=sys.stderr)
     def run_train():
         global training_process
-        is_win = sys.platform == "win32"
-        training_process = subprocess.Popen(cmd, shell=is_win)
+        # Use start_new_session=True to create a process group for clean termination on Linux
+        training_process = subprocess.Popen(cmd, start_new_session=True)
         training_process.wait()
         play_done_chime()
         print(f"\nTraining finished (Code {training_process.returncode}).", file=sys.stderr)
+
+
         
     threading.Thread(target=run_train, daemon=True).start()
     return f"Training task '{output_name}' started in background."
@@ -700,51 +756,63 @@ def start_training(model_choice, train_manifest, val_manifest, output_name, lr, 
 def stop_training():
     global training_process
     if training_process is not None and training_process.poll() is None:
-        if os.name == 'nt':
-            # Force kill the entire process tree on Windows (PID + children)
+        # Kill the entire process group
+        try:
+            os.killpg(os.getpgid(training_process.pid), signal.SIGTERM)
+            training_process.wait(timeout=5)
+        except:
             try:
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(training_process.pid)], capture_output=True)
+                os.killpg(os.getpgid(training_process.pid), signal.SIGKILL)
             except:
-                training_process.kill()
-        else:
-            training_process.terminate()
+                pass
             
         print("Training terminated by user.", file=sys.stderr)
         return "Training stopped."
     return "No training running."
 
+
+
+
 def launch_tensorboard(output_name):
     if not output_name:
         return "Please select or type an Output Directory Name first."
     
-    # Just point to the project exp directory, TensorBoard will scan subfolders
-    # including the /tensorboard/ folder created by Accelerate
+    # Point to the project exp directory
     tb_dir = project_root / "exp" / output_name
     if not tb_dir.exists():
         tb_dir = project_root / "exp"
     
     # Kill any existing TensorBoard to avoid port conflicts
-    if sys.platform == "win32":
-        try:
-            subprocess.run(["taskkill", "/F", "/IM", "tensorboard.exe"], 
-                         capture_output=True, timeout=5)
-        except Exception:
-            pass
+    try:
+        subprocess.run(["pkill", "-f", "tensorboard"], capture_output=True)
+    except: pass
     
-    if sys.platform == "win32":
-        # On Windows, open a new console window and keep it open (/k) so the user can see errors
-        tb_cmd_win = ["cmd.exe", "/k", sys.executable, "-m", "tensorboard.main", "--logdir", str(tb_dir), "--port", "6006", "--bind_all"]
-        import subprocess as sp
-        CREATE_NEW_CONSOLE = 0x00000010
-        subprocess.Popen(tb_cmd_win, creationflags=CREATE_NEW_CONSOLE)
-    else:
-        tb_cmd = [sys.executable, "-m", "tensorboard.main", "--logdir", str(tb_dir), "--port", "6006", "--bind_all"]
-        subprocess.Popen(tb_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    
-    import webbrowser
-    time.sleep(3)
-    webbrowser.open("http://localhost:6006")
-    return f"TensorBoard launched at http://localhost:6006 (logdir: {tb_dir})"
+    port = 6006
+    # Launch tensorboard as a background process (Exact Fish Audio style)
+    cmd = f"tensorboard --logdir \"{tb_dir}\" --port {port}"
+    try:
+        subprocess.Popen(
+            cmd, 
+            shell=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        
+        # Give it a moment to start (Fish Audio uses 5s)
+        import time
+        time.sleep(5.0)
+        import webbrowser
+        webbrowser.open(f"http://localhost:{port}")
+            
+        return f"TensorBoard launched for '{output_name}' at http://localhost:{port} (Opened in browser)"
+
+    except Exception as e:
+        return f"Error launching TensorBoard: {e}"
+
+
+
+
+
 
 
 def add_dialogue_row_at(index, count, *args):
@@ -1177,6 +1245,7 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                                 refresh_infer_sample_btn = gr.Button("🔄", scale=1, min_width=50)
                             
                             infer_ref_audio = gr.Audio(label="Reference Audio (3-10s recommended)", type="filepath", value=default_audio)
+                            
                             with gr.Row():
                                 infer_use_ref_text = gr.Checkbox(
                                     label="Use Reference Text (Transcription)", 
@@ -1272,6 +1341,8 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                     with gr.Row():
                         dialogue_status_out = gr.Textbox(label="Status", interactive=False, lines=2)
             
+            # --- Inference Tab Events ---
+
             # --- Unified Event Handlers ---
             def refresh_models():
                 choices = list(OMNIVOICE_MODELS.keys()) + [(f"{ckpt[0]} (Trained LoRa)", ckpt[0]) for ckpt in scan_lora_checkpoints(with_info=True)]
@@ -1702,6 +1773,14 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                             label="Inference Reference Audio",
                             type="filepath"
                         )
+                        eval_transcribe_btn = gr.Button("🎙️ Transcribe Reference", variant="secondary", size="sm")
+                        eval_ref_text = gr.Textbox(
+                            label="Reference Text / Transcription",
+                            placeholder="Manually transcribe or use the button above to avoid ASR in training.",
+                            lines=2,
+                            interactive=True
+                        )
+
 
                     with gr.Accordion("🔧 Advanced Settings", open=False, elem_classes="accordion"):
                         with gr.Row():
@@ -1738,6 +1817,13 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                         lines=2
                     )
 
+            # --- Training Tab Events ---
+            eval_transcribe_btn.click(
+                fn=transcribe_audio_ui,
+                inputs=[eval_audio, infer_whisper_model, infer_whisper_lang],
+                outputs=[eval_ref_text]
+            )
+
             start_btn.click(
                 start_training,
                 inputs=[
@@ -1754,6 +1840,7 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                     save_steps,
                     eval_text,
                     eval_audio,
+                    eval_ref_text,
                     enable_eval,
                     lang_code,
                     attn_impl_select,
@@ -1762,6 +1849,7 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                 ],
                 outputs=[logs_out],
             )
+
             stop_btn.click(stop_training, outputs=[logs_out])
             tb_btn.click(launch_tensorboard, inputs=[output_name], outputs=[logs_out])
 
