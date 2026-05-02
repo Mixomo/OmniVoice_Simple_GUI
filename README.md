@@ -12,6 +12,32 @@ A comprehensive and optimized WebUI for working with **OmniVoice** on Windows. T
 
 <img src="./assets/training_tab.png">
 
+### 2026-05-02 - Training Resume, Built-In Voice & Inference UX Update
+This update improves LoRA training workflows, safer checkpoint resume, and inference controls based on real-world issue triage:
+
+*   **Built-In Voice LoRA Conditioning**:
+    *   Added **LoRA Conditioning Mode** in Training.
+    *   **Reference-guided voice cloning** keeps the normal OmniVoice behavior, where inference is expected to use a reference voice sample.
+    *   **Built-in voice (no reference prompt)** sets `prompt_ratio_range` to `[0.0, 0.0]`, training the dataset voice as the default LoRA voice for inference without reference audio.
+    *   TensorBoard Eval Zone now respects this mode: built-in voice validation generates audio from `eval_text` only, without requiring `eval_ref_audio` or `eval_ref_text`.
+*   **Training Project Recovery & Resume UX**:
+    *   The **Output Directory Name** dropdown now doubles as a project selector.
+    *   Selecting an existing `exp/` project reloads saved training settings from `train_config.json` and `data_config.json` into the GUI.
+    *   Added a refresh button for **Resume from Checkpoint Path**.
+    *   Project loading updates resume choices but leaves resume set to **None**, so users can retrain from scratch unless they explicitly choose a checkpoint.
+*   **Checkpoint Resume Stability**:
+    *   Fixed checkpoints being polluted by inference-only modules during TensorBoard audio generation.
+    *   Checkpoint saving now strips temporary inference attributes such as `audio_tokenizer` before saving.
+    *   Resume now automatically sanitizes older affected checkpoints by removing unexpected `audio_tokenizer.*` keys, keeping a `.bak` copy of the original file.
+*   **Inference Text & Voice Consistency**:
+    *   Removed the old global punctuation workaround that inserted spaces before `.`, `,`, `!`, `?`, etc., because it could make some models pronounce punctuation literally.
+    *   Added safer inference text normalization that collapses whitespace and removes spaces before punctuation.
+    *   For `Split by Paragraphs` in instruct/auto voice mode without a reference sample, the first generated clip is reused internally as the reference for later paragraphs to improve voice consistency.
+*   **Advanced Inference UI Cleanup**:
+    *   Added short explanations to decoding, sampling, duration, and chunking controls.
+    *   Set **Post-process Audio** default to off to avoid unwanted fading/trimming unless users opt in.
+    *   Added guidance explaining that Voice Design and tag selectors are quick starting points; for maximum control, users should write tags and instructions manually in the target text where needed.
+
 ### 2026-04-26 - Stability & Democratization Update: Pascal Support & VRAM Fixes
 This massive update focuses on making OmniVoice stable for long training sessions and accessible to a wider range of NVIDIA GPUs:
 
@@ -131,4 +157,3 @@ git clone https://github.com/Mixomo/OmniVoice_Simple_GUI.git
 Inspired by [FranckyB](https://github.com/FranckyB) [Voice Clone Studio](https://github.com/FranckyB/Voice-Clone-Studio)
 
 Based on [OmniVoice](https://github.com/k2-fsa/OmniVoice) by [K2-FSA](https://github.com/k2-fsa)
-

@@ -423,6 +423,13 @@ class OmniTrainer:
             # 3. Use the existing model instead of reloading from disk
             inf_model = model_unwrapped
             inf_model.eval()
+            original_inference_attrs = {
+                "text_tokenizer": getattr(model_unwrapped, "text_tokenizer", None),
+                "audio_tokenizer": getattr(model_unwrapped, "audio_tokenizer", None),
+                "feature_extractor": getattr(model_unwrapped, "feature_extractor", None),
+                "sampling_rate": getattr(model_unwrapped, "sampling_rate", None),
+                "duration_estimator": getattr(model_unwrapped, "duration_estimator", None),
+            }
 
             # 4. Generate with fixed seed
             torch.manual_seed(42)
@@ -434,11 +441,12 @@ class OmniTrainer:
             gen_text = self.config.eval_text
             ref_audio = self.config.eval_ref_audio
             eval_ref_text = getattr(self.config, "eval_ref_text", None)
+            eval_use_reference = getattr(self.config, "eval_use_reference", True)
 
             final_ref = None
-            if ref_audio and os.path.exists(ref_audio):
+            if eval_use_reference and ref_audio and os.path.exists(ref_audio):
                 final_ref = ref_audio
-            elif self.eval_dataloader is not None:
+            elif eval_use_reference and self.eval_dataloader is not None:
                 try:
                     raw_reader = self.eval_dataloader.dataset
                     sample = next(iter(raw_reader))
@@ -446,6 +454,8 @@ class OmniTrainer:
                     logger.info("Using automatic sample from evaluation set.")
                 except Exception:
                     pass
+            elif not eval_use_reference:
+                logger.info("Generating evaluation audio without reference prompt.")
 
             gen_kwargs = {"text": gen_text, "num_step": 32}
             if final_ref is not None:
@@ -485,6 +495,9 @@ class OmniTrainer:
         except Exception as e:
             logger.error(f"❌ Failed to generate evolution audio: {e}")
         finally:
+            if "original_inference_attrs" in locals():
+                for attr, value in original_inference_attrs.items():
+                    setattr(model_unwrapped, attr, value)
             # Restore model to training mode
             self.model.train()
 
@@ -498,4 +511,3 @@ class OmniTrainer:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-

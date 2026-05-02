@@ -34,9 +34,69 @@ from typing import Any, Dict, Optional
 
 import torch
 from accelerate import Accelerator
+from safetensors import safe_open
+from safetensors.torch import save_file
 from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
+
+
+_INFERENCE_ONLY_ATTRS = (
+    "text_tokenizer",
+    "audio_tokenizer",
+    "feature_extractor",
+    "duration_estimator",
+    "sampling_rate",
+    "_asr_pipe",
+)
+
+
+def _strip_inference_only_attrs(model: torch.nn.Module):
+    saved = {}
+    for attr in _INFERENCE_ONLY_ATTRS:
+        if hasattr(model, attr):
+            saved[attr] = getattr(model, attr)
+            setattr(model, attr, None)
+    return saved
+
+
+def _restore_attrs(model: torch.nn.Module, saved: Dict[str, Any]):
+    for attr, value in saved.items():
+        setattr(model, attr, value)
+
+
+def _sanitize_accelerate_model_file(checkpoint_path: str) -> bool:
+    model_file = os.path.join(checkpoint_path, "model.safetensors")
+    if not os.path.exists(model_file):
+        return False
+
+    with safe_open(model_file, framework="pt", device="cpu") as f:
+        keys = list(f.keys())
+        metadata = f.metadata()
+        clean_keys = [k for k in keys if not k.startswith("audio_tokenizer.")]
+        if len(clean_keys) == len(keys):
+            return False
+        tensors = {k: f.get_tensor(k) for k in clean_keys}
+
+    tmp_file = model_file + ".tmp"
+    backup_file = model_file + ".with_inference_modules.bak"
+    save_file(tensors, tmp_file, metadata=metadata)
+
+    if not os.path.exists(backup_file):
+        shutil.move(model_file, backup_file)
+    else:
+        os.remove(model_file)
+    shutil.move(tmp_file, model_file)
+
+    removed = len(keys) - len(clean_keys)
+    logger.warning(
+        "Sanitized %s by removing %s inference-only audio_tokenizer keys. "
+        "Original file kept as %s",
+        model_file,
+        removed,
+        backup_file,
+    )
+    return True
 
 
 class TrainLogger:
@@ -129,16 +189,20 @@ def save_checkpoint(
     """
     checkpoint_dir = os.path.join(output_dir, f"checkpoint-{step}")
 
-    # 1. Save Accelerator State (Optimizer, Scheduler, RNG, Scaler)
-    accelerator.save_state(checkpoint_dir)
-
-    # 2. Save Model in HF format (config.json + pytorch_model.bin/safetensors)
     unwrap_model = accelerator.unwrap_model(model)
-    unwrap_model.save_pretrained(
-        checkpoint_dir,
-        is_main_process=accelerator.is_main_process,
-        save_function=accelerator.save,
-    )
+    saved_attrs = _strip_inference_only_attrs(unwrap_model)
+    try:
+        # 1. Save Accelerator State (Optimizer, Scheduler, RNG, Scaler)
+        accelerator.save_state(checkpoint_dir)
+
+        # 2. Save Model in HF format (config.json + pytorch_model.bin/safetensors)
+        unwrap_model.save_pretrained(
+            checkpoint_dir,
+            is_main_process=accelerator.is_main_process,
+            save_function=accelerator.save,
+        )
+    finally:
+        _restore_attrs(unwrap_model, saved_attrs)
 
     # 3. Save Tokenizer
     if accelerator.is_main_process:
@@ -169,7 +233,15 @@ def load_checkpoint(accelerator: Accelerator, checkpoint_path: str):
     Resumes training state.
     """
     logger.info(f"Resuming from {checkpoint_path}")
-    accelerator.load_state(checkpoint_path)
+    try:
+        accelerator.load_state(checkpoint_path)
+    except RuntimeError as e:
+        if "Unexpected key(s) in state_dict" not in str(e):
+            raise
+        if not _sanitize_accelerate_model_file(checkpoint_path):
+            raise
+        logger.info("Retrying checkpoint load after sanitizing inference-only keys.")
+        accelerator.load_state(checkpoint_path)
 
     # Try to infer step
     try:
