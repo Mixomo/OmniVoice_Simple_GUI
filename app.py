@@ -12,6 +12,7 @@ import threading
 import shutil
 import random
 import datetime
+import re
 from pathlib import Path
 from typing import Optional
 import math
@@ -51,6 +52,10 @@ OMNIVOICE_MODELS = {
     "OmniVoice-bf16": "drbaph/OmniVoice-bf16",
     "OmniVoice-Singing": "ModelsLab/omnivoice-singing"
 }
+
+def normalize_inference_text(text):
+    text = re.sub(r"\s+", " ", text or "").strip()
+    return re.sub(r"\s+([,.;:!?])", r"\1", text)
 
 def unload_asr():
     global asr_model
@@ -330,6 +335,43 @@ def scan_lora_checkpoints(with_info=False):
     
     return sorted(checkpoints, key=lambda x: x[0] if isinstance(x, tuple) else x)
 
+def _latest_project_checkpoint(project_path):
+    if not project_path.exists():
+        return "None"
+    checkpoints = []
+    for child in project_path.iterdir():
+        if child.is_dir() and child.name.startswith("checkpoint-"):
+            try:
+                checkpoints.append((int(child.name.split("-")[-1]), child))
+            except ValueError:
+                pass
+    if not checkpoints:
+        return "None"
+    latest = max(checkpoints, key=lambda item: item[0])[1]
+    return str(latest.relative_to(project_root)).replace("\\", "/")
+
+def _read_json_if_exists(path):
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Failed to read {path}: {e}", file=sys.stderr)
+        return {}
+
+def _model_choice_from_checkpoint(init_from_checkpoint):
+    for label, repo_id in OMNIVOICE_MODELS.items():
+        if init_from_checkpoint == repo_id:
+            return label
+    return init_from_checkpoint or "OmniVoice (Official)"
+
+def _training_mode_from_config(train_config):
+    prompt_range = train_config.get("prompt_ratio_range")
+    if prompt_range == [0.0, 0.0] or prompt_range == (0.0, 0.0):
+        return "Built-in voice (no reference prompt)"
+    return "Reference-guided voice cloning"
+
 def delete_lora_folder(name):
     if not name or name.strip() == "":
         return gr.update(), "Please select a project to delete."
@@ -576,17 +618,19 @@ def run_inference(text, ref_audio, ref_text, model_selection, cfg_scale, steps, 
         audio_chunk_duration=float(chunk_dur),
         audio_chunk_threshold=float(chunk_thr),
         preprocess_prompt=bool(pp), 
-        postprocess_output=bool(po)
+        postprocess_output=bool(po),
     )
-
-    import re
 
     try:
         # Pre-calculate voice clone prompt if needed
         voice_clone_prompt = None
         if ref_audio:
             final_ref_text = (ref_text or None) if use_ref_text else None
-            voice_clone_prompt = current_model.create_voice_clone_prompt(ref_audio=ref_audio, ref_text=final_ref_text)
+            voice_clone_prompt = current_model.create_voice_clone_prompt(
+                ref_audio=ref_audio,
+                ref_text=final_ref_text,
+                preprocess_prompt=bool(pp),
+            )
 
         for i, para in enumerate(paragraphs):
             progress((i / num_clips), desc=f"Generating clip {i+1}/{num_clips} ({len(para)} chars)...")
@@ -595,10 +639,8 @@ def run_inference(text, ref_audio, ref_text, model_selection, cfg_scale, steps, 
             current_text = para.strip()
             if tags_list:
                 current_text = " ".join(tags_list) + " " + current_text
-            
-            # Workaround for Spanish punctuation drop (Issue #116)
-            current_text = re.sub(r'([,\.\!\?\;:])', r' \1', current_text)
-            current_text = re.sub(r'\s+', ' ', current_text).strip()
+
+            current_text = normalize_inference_text(current_text)
 
             current_kw = {
                 "text": current_text, 
@@ -614,6 +656,18 @@ def run_inference(text, ref_audio, ref_text, model_selection, cfg_scale, steps, 
             audio_out = current_model.generate(**current_kw)
             audio_segments.append(audio_out[0])
             sampling_rate = current_model.sampling_rate
+
+            if (
+                voice_clone_prompt is None
+                and split_by_paragraph
+                and i == 0
+                and num_clips > 1
+            ):
+                voice_clone_prompt = current_model.create_voice_clone_prompt(
+                    ref_audio=(audio_out[0], sampling_rate),
+                    ref_text=current_text,
+                    preprocess_prompt=False,
+                )
             
             # Add 0.5 second of silence after each paragraph (except the last one)
             if split_by_paragraph and i < num_clips - 1:
@@ -639,7 +693,7 @@ def run_inference(text, ref_audio, ref_text, model_selection, cfg_scale, steps, 
             return None, f"Triton/Compiler Error: {err_msg}. Please try switching Attention Implementation to 'sdpa' in Optimization settings."
         return None, f"Error: {err_msg}"
 
-def start_training(model_choice, train_manifest, val_manifest, output_name, lr, steps, batch_tokens, llm_name, resume_checkpoint, grad_accum, save_steps, eval_text, eval_audio, eval_ref_text, enable_eval, lang_code, attn_impl, warmup_ratio=0.01, repeat_factor=1):
+def start_training(model_choice, train_manifest, val_manifest, output_name, training_mode, lr, steps, batch_tokens, llm_name, resume_checkpoint, grad_accum, save_steps, eval_text, eval_audio, eval_ref_text, enable_eval, lang_code, attn_impl, warmup_ratio=0.01, repeat_factor=1):
 
     global training_process
     if training_process and training_process.poll() is None:
@@ -676,9 +730,13 @@ def start_training(model_choice, train_manifest, val_manifest, output_name, lr, 
         "eval_text": eval_text.strip() if eval_text else "I am training and getting better every day.",
         "eval_ref_audio": final_eval_audio,
         "eval_ref_text": eval_ref_text.strip() if eval_ref_text else None,
+        "eval_use_reference": training_mode != "Built-in voice (no reference prompt)",
         "enable_eval": bool(enable_eval),
         "attn_implementation": attn_impl
     }
+
+    if training_mode == "Built-in voice (no reference prompt)":
+        train_config["prompt_ratio_range"] = [0.0, 0.0]
 
 
     # Auto-adjust num_workers based on shard count (Recipe: num_workers <= shard count)
@@ -1169,6 +1227,10 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                         - **English (CMU)**: `He plays the [B EY1 S] guitar.`
                         - **Chinese (Pinyin)**: `严重SHE2本了`
                         """)
+
+                    gr.Markdown("""
+                    **Manual control tip:** The Voice Design and Tags selectors are meant as quick starting points for short texts. For maximum control, write tags and instructions directly in the target text exactly where you want them, instead of relying only on the automatic pre-built selectors.
+                    """)
                     
                     infer_control_display = gr.Markdown("")
                     infer_control = gr.Textbox(visible=False)
@@ -1201,18 +1263,68 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                     gr.Markdown("#### 🛠️ Advanced Engine Settings")
                     with gr.Accordion("⚙️ Decoding & Sampling Parameters", open=False):
                         with gr.Row():
-                            infer_steps = gr.Slider(label="Inference Steps (num_step)", minimum=1, maximum=64, value=32, step=1)
-                            infer_cfg = gr.Slider(label="CFG Scale (guidance_scale)", minimum=1.0, maximum=5.0, value=2.0, step=0.1)
+                            infer_steps = gr.Slider(
+                                label="Inference Steps (num_step)",
+                                minimum=1,
+                                maximum=64,
+                                value=32,
+                                step=1,
+                                info="More steps can improve quality and stability, but generation is slower."
+                            )
+                            infer_cfg = gr.Slider(
+                                label="CFG Scale (guidance_scale)",
+                                minimum=1.0,
+                                maximum=5.0,
+                                value=2.0,
+                                step=0.1,
+                                info="Higher values follow text/instructions more strongly; too high can sound harsh or unstable."
+                            )
                         with gr.Row():
-                            infer_t_shift = gr.Slider(label="Time-step shift (t_shift)", minimum=0.0, maximum=1.0, value=0.1, step=0.05)
-                            infer_pos_temp = gr.Slider(label="Position Temp", minimum=0.0, maximum=10.0, value=5.0, step=0.5)
+                            infer_t_shift = gr.Slider(
+                                label="Time-step shift (t_shift)",
+                                minimum=0.0,
+                                maximum=1.0,
+                                value=0.1,
+                                step=0.05,
+                                info="Shifts the denoising schedule. Small changes can affect clarity, pacing, and artifacts."
+                            )
+                            infer_pos_temp = gr.Slider(
+                                label="Position Temp",
+                                minimum=0.0,
+                                maximum=10.0,
+                                value=5.0,
+                                step=0.5,
+                                info="Controls how freely token positions are selected. Lower is stricter; higher is more varied."
+                            )
                         with gr.Row():
-                            infer_class_temp = gr.Slider(label="Token Temp", minimum=0.0, maximum=2.0, value=0.0, step=0.1)
+                            infer_class_temp = gr.Slider(
+                                label="Token Temp",
+                                minimum=0.0,
+                                maximum=2.0,
+                                value=0.0,
+                                step=0.1,
+                                info="Controls token randomness. 0 is greedy and stable; higher adds variation but can add mistakes."
+                            )
                         with gr.Row():
-                            infer_layer_penalty = gr.Slider(label="Layer Penalty", minimum=0.0, maximum=10.0, value=5.0, step=0.5)
+                            infer_layer_penalty = gr.Slider(
+                                label="Layer Penalty",
+                                minimum=0.0,
+                                maximum=10.0,
+                                value=5.0,
+                                step=0.5,
+                                info="Encourages lower audio codebook layers to resolve earlier. Default is usually best."
+                            )
                         with gr.Row():
-                            infer_pp = gr.Checkbox(label="Pre-process Text (Normalization)", value=True)
-                            infer_po = gr.Checkbox(label="Post-process Audio (Fading)", value=True)
+                            infer_pp = gr.Checkbox(
+                                label="Pre-process Reference Audio/Text",
+                                value=True,
+                                info="Trims/silence-cleans reference audio and adds missing punctuation to reference text."
+                            )
+                            infer_po = gr.Checkbox(
+                                label="Post-process Audio",
+                                value=False,
+                                info="Removes long silences and applies final fade/padding to reduce clicks."
+                            )
                         with gr.Row():
                             infer_attn_impl = gr.Dropdown(
                                 label="Attention Implementation",
@@ -1223,11 +1335,34 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                     
                     with gr.Accordion("📏 Duration & Chunking", open=False):
                         with gr.Row():
-                            infer_duration = gr.Number(label="Fixed Duration (secs)", value=0, info="0 = use speed/auto")
-                            infer_seed = gr.Number(label="Seed (-1 for Random)", value=-1, precision=0)
+                            infer_duration = gr.Number(
+                                label="Fixed Duration (secs)",
+                                value=0,
+                                info="0 lets the model estimate duration automatically. Set a value to force output length."
+                            )
+                            infer_seed = gr.Number(
+                                label="Seed (-1 for Random)",
+                                value=-1,
+                                precision=0,
+                                info="Use a fixed seed to reproduce similar outputs. -1 keeps generation random."
+                            )
                         with gr.Row():
-                            infer_chunk_dur = gr.Slider(label="Chunk Duration", minimum=5.0, maximum=30.0, value=15.0, step=1.0)
-                            infer_chunk_thr = gr.Slider(label="Chunk Threshold", minimum=10.0, maximum=60.0, value=30.0, step=1.0)
+                            infer_chunk_dur = gr.Slider(
+                                label="Chunk Duration",
+                                minimum=5.0,
+                                maximum=30.0,
+                                value=15.0,
+                                step=1.0,
+                                info="Target length for internal chunks when long text is split. Smaller chunks use less VRAM."
+                            )
+                            infer_chunk_thr = gr.Slider(
+                                label="Chunk Threshold",
+                                minimum=10.0,
+                                maximum=60.0,
+                                value=30.0,
+                                step=1.0,
+                                info="Estimated duration above which automatic chunking activates. Raise it to avoid chunking shorter text."
+                            )
 
             with gr.Tabs():
                 with gr.Tab("Single Inference"):
@@ -1417,7 +1552,7 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                     infer_pp,
                     infer_po,
                     infer_split_by_paragraph,
-                    infer_attn_impl
+                    infer_attn_impl,
                 ],
                 outputs=[infer_audio_out, infer_status_out],
             )
@@ -1646,6 +1781,23 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                             info="Select your GPU VRAM to calibrate the Max Tokens per Batch to avoid OOM errors.",
                             scale=3
                         )
+                        training_mode = gr.Dropdown(
+                            label="LoRA Conditioning Mode",
+                            choices=[
+                                "Reference-guided voice cloning",
+                                "Built-in voice (no reference prompt)",
+                            ],
+                            value="Reference-guided voice cloning",
+                            info="Determines whether the Lora should be used with or without reference audio (instruct mode / auto voice)",
+                            scale=3
+                        )
+
+                    gr.Markdown("""
+                    **LoRA Conditioning Mode**
+
+                    - **Reference-guided voice cloning** keeps the normal OmniVoice behavior: the LoRA still learns to use reference audio/text prompts, so inference should use a voice sample.
+                    - **Built-in voice (no reference prompt)** sets `prompt_ratio_range` to `[0.0, 0.0]`: the LoRA learns the dataset voice as the default voice, so inference is intended to work without reference audio.
+                    """)
 
                     gr.Markdown("""
                     💡 **Note:** These values are just a starting point and you can modify them manually below to your liking. 
@@ -1671,6 +1823,53 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
 
                     def refresh_projects():
                         return gr.update(choices=get_existing_lora_projects())
+
+                    def load_project_settings(project_name):
+                        if not project_name:
+                            return [gr.update()] * 20
+
+                        project_path = project_root / "exp" / str(project_name)
+                        train_cfg = _read_json_if_exists(project_path / "train_config.json")
+                        data_cfg = _read_json_if_exists(project_path / "data_config.json")
+
+                        if not train_cfg and not data_cfg:
+                            return [gr.update()] * 19 + [f"No saved training config found for '{project_name}'."]
+
+                        train_entry = (data_cfg.get("train") or [{}])[0]
+                        dev_entry = (data_cfg.get("dev") or [{}])[0]
+                        train_manifest_value = (train_entry.get("manifest_path") or [None])[0]
+                        val_manifest_value = (dev_entry.get("manifest_path") or [None])[0]
+                        lang_value = train_entry.get("language_id", "")
+                        repeat_value = train_entry.get("repeat", train_cfg.get("repeat_factor", 1))
+
+                        resume_choices = ["None"] + [c[0] if isinstance(c, tuple) else c for c in scan_lora_checkpoints(with_info=False)]
+                        latest_checkpoint = _latest_project_checkpoint(project_path)
+                        if latest_checkpoint != "None" and latest_checkpoint not in resume_choices:
+                            resume_choices.append(latest_checkpoint)
+
+                        manifest_choices = scan_datasets()
+                        return [
+                            gr.update(value=_model_choice_from_checkpoint(train_cfg.get("init_from_checkpoint"))),
+                            gr.update(choices=manifest_choices, value=train_manifest_value),
+                            gr.update(choices=manifest_choices, value=val_manifest_value),
+                            gr.update(value=lang_value),
+                            gr.update(value=_training_mode_from_config(train_cfg)),
+                            gr.update(value=str(train_cfg.get("learning_rate", "1e-5"))),
+                            gr.update(value=int(train_cfg.get("steps", 250))),
+                            gr.update(value=str(train_cfg.get("batch_tokens", 4096))),
+                            gr.update(value=int(train_cfg.get("gradient_accumulation_steps", 4))),
+                            gr.update(value=int(train_cfg.get("save_steps", 25))),
+                            gr.update(value=float(train_cfg.get("warmup_ratio", 0.01))),
+                            gr.update(value=int(repeat_value)),
+                            gr.update(value=train_cfg.get("eval_text", "This is my voice evolution during training. I hope I sound like the reference soon!")),
+                            gr.update(value=train_cfg.get("eval_ref_audio")),
+                            gr.update(value=train_cfg.get("eval_ref_text")),
+                            gr.update(value=bool(train_cfg.get("enable_eval", False))),
+                            gr.update(value=train_cfg.get("llm_name_or_path", "Qwen/Qwen3-0.6B")),
+                            gr.update(choices=resume_choices, value="None"),
+                            gr.update(value=train_cfg.get("attn_implementation", "sdpa")),
+                            f"Loaded training settings from exp/{project_name}."
+                        ]
 
                     refresh_train_btn.click(refresh_manifests, outputs=[train_manifest, val_manifest])
                     refresh_val_btn.click(refresh_manifests, outputs=[train_manifest, val_manifest])
@@ -1757,6 +1956,9 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                         )
 
                     with gr.Accordion("🎨 Eval Zone (Tensorboard Audio)", open=False, elem_classes="accordion"):
+                        gr.Markdown("""
+                        **Built-in voice eval:** If `LoRA Conditioning Mode` is set to **Built-in voice (no reference prompt)**, TensorBoard audio validation uses only the test text. Reference audio and reference text are optional and ignored for that mode.
+                        """)
                         enable_eval = gr.Checkbox(
                             label="Enable Eval Zone",
                             value=False,
@@ -1789,13 +1991,16 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                                 value="Qwen/Qwen3-0.6B",
                                 info="Local LLM path or HuggingFace ID."
                             )
-                            resume_checkpoint = gr.Dropdown(
-                                label="Resume from Checkpoint Path",
-                                choices=["None"] + [c[0] if isinstance(c, tuple) else c for c in scan_lora_checkpoints(with_info=False)],
-                                value="None",
-                                allow_custom_value=True,
-                                info="If provided, resumes training from this local checkpoint directory."
-                            )
+                            with gr.Row():
+                                resume_checkpoint = gr.Dropdown(
+                                    label="Resume from Checkpoint Path",
+                                    choices=["None"] + [c[0] if isinstance(c, tuple) else c for c in scan_lora_checkpoints(with_info=False)],
+                                    value="None",
+                                    allow_custom_value=True,
+                                    info="If provided, resumes training from this local checkpoint directory.",
+                                    scale=8
+                                )
+                                refresh_resume_btn = gr.Button("🔄", scale=1, min_width=50)
                         with gr.Row():
                             attn_impl_select = gr.Dropdown(
                                 label="Attention Implementation",
@@ -1831,6 +2036,7 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
                     train_manifest,
                     val_manifest,
                     output_name,
+                    training_mode,
                     lr,
                     steps_num,
                     batch_tokens_num,
@@ -1852,12 +2058,42 @@ with gr.Blocks(title="OmniVoice - Simple GUI | Inference + LoRa Training") as ap
 
             stop_btn.click(stop_training, outputs=[logs_out])
             tb_btn.click(launch_tensorboard, inputs=[output_name], outputs=[logs_out])
+            refresh_resume_btn.click(
+                lambda: gr.update(choices=["None"] + [c[0] if isinstance(c, tuple) else c for c in scan_lora_checkpoints(with_info=False)]),
+                outputs=[resume_checkpoint]
+            )
+            output_name.change(
+                load_project_settings,
+                inputs=[output_name],
+                outputs=[
+                    train_model_select,
+                    train_manifest,
+                    val_manifest,
+                    lang_code,
+                    training_mode,
+                    lr,
+                    steps_num,
+                    batch_tokens_num,
+                    grad_accum,
+                    save_steps,
+                    warmup_ratio,
+                    repeat_factor,
+                    eval_text,
+                    eval_audio,
+                    eval_ref_text,
+                    enable_eval,
+                    llm_name,
+                    resume_checkpoint,
+                    attn_impl_select,
+                    logs_out,
+                ]
+            )
 
             def on_auto_calc(manifest, vram):
                 count, total_dur, avg_dur, total_tokens = calculate_dataset_stats(manifest)
                 
                 if count == 0:
-                    return [gr.update()] * 7 + [gr.update(value="Error: Train Manifest is empty or not selected.", visible=True)]
+                    return [gr.update()] * 7
                     
                 duration_mins = total_dur / 60.0
                 

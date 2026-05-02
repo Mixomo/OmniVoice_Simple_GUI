@@ -92,6 +92,7 @@ class TrainingConfig:
     # Audio Evolution Logging
     enable_eval: bool = True
     eval_text: str = "This is a test of the OmniVoice system."
+    eval_use_reference: bool = True
     eval_ref_audio: Optional[str] = None
     eval_ref_text: Optional[str] = None
 
